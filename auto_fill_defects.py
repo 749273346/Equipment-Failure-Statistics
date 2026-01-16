@@ -10,6 +10,7 @@ from ttkbootstrap.scrolled import ScrolledText
 import win32com.client
 import openpyxl
 from openpyxl.styles import Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -69,8 +70,15 @@ class DefectProcessor:
         return 0
 
     def _estimate_row_height(self, row_data, base_height=45, max_height=150):
+        data = list(row_data or [])
+        if data:
+            last = data[-1]
+            if isinstance(last, str):
+                s = last.strip()
+                if s and (":\\" in s or "\\" in s or "/" in s) and s.lower().endswith((".doc", ".docx")):
+                    data = data[:-1]
         max_len = 0
-        for cell_text in row_data or []:
+        for cell_text in data:
             if cell_text is None:
                 continue
             max_len = max(max_len, len(str(cell_text)))
@@ -112,22 +120,35 @@ class DefectProcessor:
         except Exception:
             dst_cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
 
-    def _write_rows_to_excel(self, target_excel, extracted_rows):
+    def _write_rows_to_excel(self, target_excel, extracted_rows, overwrite=False):
         wb = openpyxl.load_workbook(target_excel)
         ws = wb.active
 
-        last_valid_row = self._find_last_valid_row(ws, min_row=3, serial_col=1, max_cols=13)
-        template_row = last_valid_row if last_valid_row >= 3 else 3
-
-        last_serial = self._coerce_int(ws.cell(row=last_valid_row, column=1).value) if last_valid_row >= 3 else 0
+        if overwrite:
+            template_row = 3 if ws.max_row >= 3 else 1
+            if ws.max_row >= 4:
+                try:
+                    ws.delete_rows(4, ws.max_row - 3)
+                except Exception:
+                    pass
+            last_serial = 0
+            current_row = 4
+        else:
+            last_valid_row = self._find_last_valid_row(ws, min_row=3, serial_col=1, max_cols=14)
+            template_row = last_valid_row if last_valid_row >= 3 else 3
+            last_serial = self._coerce_int(ws.cell(row=last_valid_row, column=1).value) if last_valid_row >= 3 else 0
+            current_row = (last_valid_row if last_valid_row >= 3 else 2) + 1
 
         template_cells = [ws.cell(row=template_row, column=c) for c in range(1, 14)]
         template_height = ws.row_dimensions[template_row].height
         if template_height is None:
             template_height = 45
-
-        current_row = (last_valid_row if last_valid_row >= 3 else 2) + 1
         serial = last_serial
+
+        try:
+            ws.column_dimensions[get_column_letter(14)].hidden = True
+        except Exception:
+            pass
 
         wrote = 0
         for row_data in extracted_rows:
@@ -135,9 +156,9 @@ class DefectProcessor:
                 continue
 
             serial += 1
-            if len(row_data) < 13:
-                row_data = list(row_data) + [""] * (13 - len(row_data))
-            row_data = row_data[:13]
+            if len(row_data) < 14:
+                row_data = list(row_data) + [""] * (14 - len(row_data))
+            row_data = row_data[:14]
             row_data[0] = str(serial)
 
             height = self._estimate_row_height(row_data, base_height=template_height)
@@ -145,7 +166,8 @@ class DefectProcessor:
 
             for col_idx, value in enumerate(row_data, start=1):
                 dst_cell = ws.cell(row=current_row, column=col_idx, value=value)
-                self._apply_template_style(dst_cell, template_cells[col_idx - 1])
+                if col_idx <= 13:
+                    self._apply_template_style(dst_cell, template_cells[col_idx - 1])
 
             wrote += 1
             current_row += 1
@@ -153,7 +175,7 @@ class DefectProcessor:
         wb.save(target_excel)
         return wrote
 
-    def process_source(self, source_path, target_excel):
+    def process_source(self, source_path, target_excel, overwrite=False):
         self.log(f"开始处理: {source_path}")
         
         if not os.path.exists(target_excel):
@@ -215,7 +237,7 @@ class DefectProcessor:
                             for r in range(2, row_count + 1):
                                 row_data = []
                                 try:
-                                    for c in range(1, 14): # 1 to 13
+                                    for c in range(1, 14):
                                         try:
                                             cell_text = table.Cell(r, c).Range.Text
                                             cell_text = cell_text.replace('\r', '').replace('\x07', '').strip()
@@ -223,7 +245,6 @@ class DefectProcessor:
                                         except Exception:
                                             row_data.append("")
                                     
-                                    # Filter: Check if any column OTHER THAN the first one (Serial No) has content
                                     has_content = False
                                     if len(row_data) > 1:
                                         for cell in row_data[1:]:
@@ -232,6 +253,7 @@ class DefectProcessor:
                                                 break
                                     
                                     if has_content:
+                                        row_data.append(file_path)
                                         extracted_rows.append(row_data)
                                 except Exception as e:
                                     pass
@@ -274,8 +296,11 @@ class DefectProcessor:
 
         # 3. Write to Excel
         try:
-            wrote = self._write_rows_to_excel(target_excel, extracted_rows)
-            self.log(f"写入成功！新增 {wrote} 条记录，已保存到: {target_excel}")
+            wrote = self._write_rows_to_excel(target_excel, extracted_rows, overwrite=overwrite)
+            if overwrite:
+                self.log(f"写入成功！已刷新 {wrote} 条记录，已保存到: {target_excel}")
+            else:
+                self.log(f"写入成功！新增 {wrote} 条记录，已保存到: {target_excel}")
             return True
 
         except PermissionError:
@@ -287,9 +312,10 @@ class DefectProcessor:
             return False
 
 class StatisticsPanel(ttk.Frame):
-    def __init__(self, parent, excel_path):
+    def __init__(self, parent, excel_path, app_instance=None):
         super().__init__(parent)
         self.excel_path = excel_path
+        self.app = app_instance
         self.df = None
         self._resize_job = None
         self._last_canvas_size = None
@@ -298,6 +324,7 @@ class StatisticsPanel(ttk.Frame):
         self._redraw_stable = 0
         self._redraw_last = None
         self._layout_mode = None
+        self.file_path_map = {}
         self.setup_ui()
 
     def setup_ui(self):
@@ -308,6 +335,10 @@ class StatisticsPanel(ttk.Frame):
         # Load Button
         self.btn_load = ttk.Button(control_frame, text="🔄 加载数据", command=self.load_data, bootstyle=PRIMARY)
         self.btn_load.pack(side=LEFT)
+        
+        # Sync Button
+        if self.app:
+            ttk.Button(control_frame, text="🔁 同步并刷新", command=self.on_sync, bootstyle=SUCCESS).pack(side=LEFT, padx=5)
         
         ttk.Separator(control_frame, orient=VERTICAL).pack(side=LEFT, padx=10, fill=Y)
 
@@ -333,12 +364,37 @@ class StatisticsPanel(ttk.Frame):
         self.lbl_status = ttk.Label(control_frame, text="请先加载数据", bootstyle=SECONDARY)
         self.lbl_status.pack(side=LEFT, padx=20)
 
-        # Dashboard Area
-        self.dashboard_frame = ttk.Frame(self, padding=10)
-        self.dashboard_frame.pack(fill=BOTH, expand=YES)
+        # Content Area
+        self.content_area = ttk.Frame(self)
+        self.content_area.pack(fill=BOTH, expand=YES, pady=10)
         
+        # View 1: Dashboard
+        self.view_dashboard = ttk.Frame(self.content_area, padding=10)
+        self.setup_dashboard_tab(self.view_dashboard)
+        
+        # View 2: Detail List
+        self.view_details = ttk.Frame(self.content_area, padding=0)
+        self.setup_details_tab(self.view_details)
+        
+        # Default View
+        self.current_view = None
+        self.switch_view("chart")
+
+    def switch_view(self, view_name):
+        if self.current_view:
+            self.current_view.pack_forget()
+            
+        if view_name == "chart":
+            self.view_dashboard.pack(fill=BOTH, expand=YES)
+            self.current_view = self.view_dashboard
+            self.request_redraw()
+        elif view_name == "list":
+            self.view_details.pack(fill=BOTH, expand=YES)
+            self.current_view = self.view_details
+
+    def setup_dashboard_tab(self, parent):
         # Summary Cards (Top)
-        self.cards_frame = ttk.Frame(self.dashboard_frame)
+        self.cards_frame = ttk.Frame(parent)
         self.cards_frame.pack(fill=X, pady=10)
         
         self.card_total = self.create_card(self.cards_frame, "缺陷总数", "0", "info")
@@ -346,7 +402,7 @@ class StatisticsPanel(ttk.Frame):
         self.card_closed = self.create_card(self.cards_frame, "已销号", "0", "success")
         
         # Charts Area (Middle)
-        self.charts_frame = ttk.Frame(self.dashboard_frame)
+        self.charts_frame = ttk.Frame(parent)
         self.charts_frame.pack(fill=BOTH, expand=YES, pady=10)
         
         self.fig = Figure(figsize=(10, 5), dpi=100, constrained_layout=True)
@@ -356,6 +412,41 @@ class StatisticsPanel(ttk.Frame):
         self.canvas_widget.pack(fill=BOTH, expand=YES)
         self.canvas_widget.bind("<Configure>", self.on_resize, add="+")
         self.after(0, self._sync_figure_dpi_to_tk)
+
+    def setup_details_tab(self, parent):
+        # Treeview
+        columns = ("serial", "location", "type", "status", "date", "action")
+        self.tree = ttk.Treeview(parent, columns=columns, show="headings", bootstyle="primary")
+        
+        self.tree.heading("serial", text="序号")
+        self.tree.heading("location", text="设备缺陷地点")
+        self.tree.heading("type", text="设备缺陷类型")
+        self.tree.heading("status", text="状态")
+        self.tree.heading("date", text="销号时间")
+        self.tree.heading("action", text="操作")
+        
+        self.tree.column("serial", width=60, anchor="center")
+        self.tree.column("location", width=250)
+        self.tree.column("type", width=150)
+        self.tree.column("status", width=100, anchor="center")
+        self.tree.column("date", width=150, anchor="center")
+        self.tree.column("action", width=100, anchor="center")
+        
+        # Scrollbar
+        vsb = ttk.Scrollbar(parent, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        
+        self.tree.pack(side=LEFT, fill=BOTH, expand=YES)
+        vsb.pack(side=RIGHT, fill=Y)
+        
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
+        
+        # Tooltip or instructions
+        ttk.Label(parent, text="💡 双击条目可打开原始Word文档", bootstyle="info").pack(side=BOTTOM, fill=X, padx=5, pady=2)
+
+    def on_sync(self):
+        if self.app:
+            self.app.run_sync_process_from_stats()
 
     def on_resize(self, event):
         self._last_canvas_size = (event.width, event.height)
@@ -484,11 +575,10 @@ class StatisticsPanel(ttk.Frame):
             return
 
         try:
-            # Read Excel
             df = pd.read_excel(path, header=2)
             required_cols = ['设备缺陷类型', '销号时间', '设备缺陷地点']
             if not all(col in df.columns for col in required_cols):
-                df = pd.read_excel(path) # Retry without header offset
+                df = pd.read_excel(path) 
             
             self.df = df
             
@@ -538,6 +628,80 @@ class StatisticsPanel(ttk.Frame):
         
         # 2. Update Charts
         self.render_charts(df)
+        
+        # 3. Update Detail List
+        self.update_detail_list(df)
+
+    def update_detail_list(self, df):
+        # Clear existing
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.file_path_map.clear()
+        
+        if df is None or df.empty:
+            return
+
+        for index, row in df.iterrows():
+            serial = ""
+            try:
+                if '序号' in df.columns:
+                    serial = row.get('序号', "")
+                elif len(row) > 0:
+                    serial = row.iloc[0]
+            except Exception:
+                serial = ""
+            if serial is None or str(serial).strip() == "" or str(serial).strip().lower() == "nan":
+                serial = index + 1
+            loc = row.get('设备缺陷地点', '')
+            dtype = row.get('设备缺陷类型', '')
+            date_val = row.get('销号时间')
+            date_ts = pd.to_datetime(date_val, errors='coerce')
+            is_closed = pd.notna(date_ts)
+            status_text = "✅ 已销号" if is_closed else "🔴 未销号"
+            date_str = date_ts.strftime('%Y-%m-%d') if is_closed else "-"
+            
+            source_path = ""
+            try:
+                for v in reversed(list(row.values)):
+                    if not isinstance(v, str):
+                        continue
+                    s = v.strip()
+                    if not s:
+                        continue
+                    if (":\\" in s or "\\" in s or "/" in s) and s.lower().endswith((".doc", ".docx")):
+                        source_path = s
+                        break
+            except Exception:
+                source_path = ""
+            
+            # Insert into Treeview
+            item_id = self.tree.insert("", "end", values=(serial, loc, dtype, status_text, date_str, "📂 打开"))
+            
+            # Store file path
+            if source_path and os.path.exists(source_path):
+                self.file_path_map[item_id] = source_path
+            
+            if not is_closed:
+                self.tree.item(item_id, tags=("open",))
+            else:
+                self.tree.item(item_id, tags=("closed",))
+
+        self.tree.tag_configure("open", foreground="red")
+        self.tree.tag_configure("closed", foreground="green")
+
+    def on_tree_double_click(self, event):
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            return
+            
+        path = self.file_path_map.get(item_id)
+        if path and os.path.exists(path):
+            try:
+                os.startfile(path)
+            except Exception as e:
+                messagebox.showerror("错误", f"无法打开文件: {e}")
+        else:
+            messagebox.showwarning("提示", "该条记录未关联到Word文档路径（可能是历史数据）。\n建议点击“同步并刷新”后再试。")
 
     def render_charts(self, df=None):
         if df is None:
@@ -695,7 +859,20 @@ class App:
         self.create_nav_btn("数据采集", "collect", "📚")
         self.create_nav_btn("统计分析", "stats", "📈")
         
-        ttk.Separator(self.sidebar).pack(fill=X, pady=20)
+        self.nav_separator = ttk.Separator(self.sidebar)
+        self.nav_separator.pack(fill=X, pady=20)
+        
+        # Sub-menu for Stats (Hidden by default)
+        self.stats_sub_menu = ttk.Frame(self.sidebar, bootstyle="secondary")
+        self.btn_view_chart = ttk.Button(self.stats_sub_menu, text="📊 图表概览", 
+                                       command=lambda: self.switch_stats_view("chart"),
+                                       bootstyle="info-link", width=15, cursor="hand2")
+        self.btn_view_chart.pack(pady=2, anchor=W, padx=(25, 0))
+        
+        self.btn_view_list = ttk.Button(self.stats_sub_menu, text="📋 明细列表", 
+                                      command=lambda: self.switch_stats_view("list"),
+                                      bootstyle="secondary-link", width=15, cursor="hand2")
+        self.btn_view_list.pack(pady=2, anchor=W, padx=(25, 0))
         
         # Theme Toggle
         self.theme_var = tk.BooleanVar(value=False) # False=Light
@@ -723,6 +900,17 @@ class App:
         btn.pack(pady=5, anchor=W)
         self.nav_btns[view_name] = btn
 
+    def switch_stats_view(self, view_type):
+        if hasattr(self, 'stats_panel'):
+            self.stats_panel.switch_view(view_type)
+            # Update button styles
+            if view_type == "chart":
+                self.btn_view_chart.configure(bootstyle="info-link")
+                self.btn_view_list.configure(bootstyle="secondary-link")
+            else:
+                self.btn_view_chart.configure(bootstyle="secondary-link")
+                self.btn_view_list.configure(bootstyle="info-link")
+
     def show_view(self, view_name):
         # Hide all
         for v in self.views.values():
@@ -731,14 +919,19 @@ class App:
         # Show selected
         if view_name in self.views:
             self.views[view_name].pack(fill=BOTH, expand=YES)
-
-        if view_name == "stats" and hasattr(self, "stats_panel"):
-            def refresh_stats():
-                try:
-                    self.stats_panel.request_redraw()
-                except Exception:
-                    return
-            self.root.after(0, refresh_stats)
+            
+        # Toggle Sub-menu
+        if view_name == "stats":
+            self.stats_sub_menu.pack(after=self.nav_separator, fill=X, pady=(0, 10))
+            if hasattr(self, "stats_panel"):
+                def refresh_stats():
+                    try:
+                        self.stats_panel.request_redraw()
+                    except Exception:
+                        return
+                self.root.after(0, refresh_stats)
+        else:
+            self.stats_sub_menu.pack_forget()
             
         # Update Nav State (Visual feedback)
         for name, btn in self.nav_btns.items():
@@ -815,8 +1008,12 @@ class App:
         self.log_area.pack(fill=BOTH, expand=YES)
 
     def create_stats_view(self):
-        self.stats_panel = StatisticsPanel(self.content_container, self.excel_path_var)
+        self.stats_panel = StatisticsPanel(self.content_container, self.excel_path_var, app_instance=self)
         self.views["stats"] = self.stats_panel
+
+    def run_sync_process_from_stats(self):
+        if messagebox.askyesno("确认", "是否立即重新扫描Word文档并更新统计数据？\n这可能需要一些时间。"):
+            self.run_process_thread(is_sync=True)
 
     # --- Actions ---
     def browse_folder(self):
@@ -869,11 +1066,12 @@ class App:
             self.progress_var.set(pct)
         self.status_var.set(f"{status_msg} ({current}/{total})")
 
-    def run_process_thread(self):
+    def run_process_thread(self, is_sync=False):
         src = self.entry_src.get()
         dst = self.entry_dst.get()
         
-        self.btn_run.config(state='disabled')
+        if not is_sync:
+            self.btn_run.config(state='disabled')
         
         # Clear log
         try:
@@ -888,15 +1086,20 @@ class App:
         
         def task():
             try:
-                success = self.processor.process_source(src, dst)
+                success = self.processor.process_source(src, dst, overwrite=is_sync)
                 if success:
-                    self.root.after(0, lambda: messagebox.showinfo("完成", "数据采集处理完成！\n请切换到“统计分析”查看结果。"))
+                    if is_sync:
+                        self.root.after(0, lambda: self.stats_panel.load_data())
+                        self.root.after(0, lambda: messagebox.showinfo("完成", "同步完成，数据已更新！"))
+                    else:
+                        self.root.after(0, lambda: messagebox.showinfo("完成", "数据采集处理完成！\n请切换到“统计分析”查看结果。"))
                 else:
                     self.root.after(0, lambda: messagebox.showerror("失败", "处理过程中遇到错误，请检查日志。"))
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("异常", str(e)))
             finally:
-                self.root.after(0, lambda: self.btn_run.config(state='normal'))
+                if not is_sync:
+                    self.root.after(0, lambda: self.btn_run.config(state='normal'))
                 self.root.after(0, lambda: self.status_var.set("就绪"))
 
         threading.Thread(target=task, daemon=True).start()
