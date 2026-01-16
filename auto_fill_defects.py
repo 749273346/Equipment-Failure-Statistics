@@ -8,6 +8,7 @@ import tempfile
 import shutil
 import json
 import subprocess
+import winsound
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from ttkbootstrap.scrolled import ScrolledText
@@ -309,6 +310,11 @@ class DefectProcessor:
             return 0
 
     def process_source(self, source_path, target_excel, overwrite=False, incremental=False):
+        try:
+            pythoncom.CoInitialize()
+        except Exception:
+            pass
+
         self.log(f"开始处理: {source_path}")
         
         if not os.path.exists(target_excel):
@@ -404,7 +410,19 @@ class DefectProcessor:
 
             def create_word():
                 kill_all_winword()
-                app = win32com.client.DispatchEx("Word.Application")
+                app = None
+                try:
+                    app = win32com.client.DispatchEx("Word.Application")
+                except Exception as e:
+                    # Try WPS fallback
+                    try:
+                        app = win32com.client.DispatchEx("Kwps.Application")
+                    except Exception:
+                        try:
+                            app = win32com.client.DispatchEx("Wps.Application")
+                        except Exception:
+                            raise e
+
                 try:
                     app.Visible = False
                 except Exception:
@@ -541,27 +559,17 @@ class DefectProcessor:
                     if last_error is None:
                         self.log(f"  错误: 无法读取文件 {file_name}")
                     else:
-                        self.log(f"  错误: 无法读取文件 {file_name}（{type(last_error).__name__}: {last_error}）")
+                        if isinstance(last_error, Exception) and "无效的类字符串" in str(last_error):
+                             self.log(f"  错误: 无法启动 Word 或 WPS。请确认已安装 Microsoft Office 或 WPS Office。")
+                        else:
+                             self.log(f"  错误: 无法读取文件 {file_name}（{type(last_error).__name__}: {last_error}）")
 
                     if is_rpc_unavailable(last_error) or consecutive_rpc_failures >= 2:
                         isolated_word = None
                         isolated_doc = None
                         isolated_error = None
                         try:
-                            kill_all_winword()
-                            isolated_word = win32com.client.DispatchEx("Word.Application")
-                            try:
-                                isolated_word.Visible = False
-                            except Exception:
-                                pass
-                            try:
-                                isolated_word.DisplayAlerts = 0
-                            except Exception:
-                                pass
-                            try:
-                                isolated_word.AutomationSecurity = 3
-                            except Exception:
-                                pass
+                            isolated_word = create_word()
                             time.sleep(0.8)
 
                             try:
@@ -983,6 +991,12 @@ class StatisticsPanel(ttk.Frame):
             if not force and self.df is not None and self._loaded_path == path and self._loaded_mtime == mtime:
                 self.lbl_status.config(text=f"数据已就绪: {time.strftime('%H:%M:%S')}")
                 self.request_redraw()
+                if not silent:
+                    try:
+                        winsound.MessageBeep()
+                    except Exception:
+                        pass
+                    messagebox.showinfo("提示", "数据无需更新，已是最新状态。")
                 return
 
             df = pd.read_excel(path, header=2)
@@ -994,22 +1008,21 @@ class StatisticsPanel(ttk.Frame):
             self._loaded_path = path
             self._loaded_mtime = mtime
             
-            self.df['销号时间'] = pd.to_datetime(self.df['销号时间'], errors='coerce')
-            filter_dt = self._get_filter_datetime(self.df)
-            years = (
-                filter_dt.dt.year.dropna()
-                .unique()
-                .astype(int)
-                .astype(str)
-                .tolist()
-            )
-            years = sorted(years)
-            self.year_cb['values'] = ["全部"] + years
+            if "销号时间" in self.df.columns:
+                self.df["销号时间"] = self._parse_datetime_series(self.df["销号时间"])
+            self._refresh_year_options(self.df)
             
             self.update_dashboard(self.df)
             self.lbl_status.config(text=f"数据已更新: {time.strftime('%H:%M:%S')}")
             self.btn_export.config(state="normal")
             self.request_redraw()
+            
+            if not silent:
+                try:
+                    winsound.MessageBeep()
+                except Exception:
+                    pass
+                messagebox.showinfo("提示", "数据加载成功！")
             
         except PermissionError:
             if not silent:
@@ -1041,12 +1054,58 @@ class StatisticsPanel(ttk.Frame):
         except Exception:
             return df['销号时间'].notna()
 
-    def _choose_reference_date_column(self, df):
-        if df is None or df.empty:
-            return None
-        if not hasattr(df, "columns"):
-            return None
+    def _get_date_candidate_columns(self, df):
+        if df is None or df.empty or not hasattr(df, "columns"):
+            return []
+        cols = []
+        for c in df.columns:
+            if c == "销号时间":
+                continue
+            s = str(c)
+            if "时间" in s or "日期" in s:
+                cols.append(c)
+        return cols
 
+    def _parse_datetime_series(self, series):
+        try:
+            return pd.to_datetime(series, errors="coerce", format="mixed")
+        except TypeError:
+            pass
+        try:
+            dt = pd.to_datetime(series, errors="coerce")
+        except Exception:
+            try:
+                dt = pd.to_datetime(series.astype(str), errors="coerce")
+            except Exception:
+                return pd.Series([pd.NaT] * len(series), index=series.index)
+        try:
+            if dt.notna().all():
+                return dt
+        except Exception:
+            return dt
+
+        try:
+            s = series.astype(str)
+        except Exception:
+            return dt
+
+        try:
+            s = s.str.strip()
+            s = s.str.replace("年", "-", regex=False)
+            s = s.str.replace("月", "-", regex=False)
+            s = s.str.replace("日", "", regex=False)
+            s = s.str.replace(".", "-", regex=False)
+            s = s.str.replace("/", "-", regex=False)
+            s = s.str.replace(r"\s+", " ", regex=True).str.strip()
+            dt2 = pd.to_datetime(s, errors="coerce")
+            return dt.where(dt.notna(), dt2)
+        except Exception:
+            return dt
+
+    def _date_column_priority_key(self, col, non_null_count=0):
+        s = str(col)
+        keywords = ["发现", "发生", "缺陷", "登记", "填报", "上报", "录入", "创建"]
+        kw_idx = next((i for i, kw in enumerate(keywords) if kw in s), len(keywords))
         exact = [
             "缺陷时间", "缺陷日期",
             "发生时间", "发生日期",
@@ -1058,27 +1117,44 @@ class StatisticsPanel(ttk.Frame):
             "创建时间", "创建日期",
             "日期",
         ]
-        for name in exact:
-            if name in df.columns and name != "销号时间":
-                return name
+        exact_idx = next((i for i, name in enumerate(exact) if name == s), len(exact))
+        return (-int(non_null_count), exact_idx, kw_idx, s)
 
-        keyword_order = ["缺陷", "发生", "发现", "登记", "填报", "上报", "录入", "创建"]
-        for kw in keyword_order:
-            for c in df.columns:
-                if c == "销号时间":
-                    continue
-                s = str(c)
-                if kw in s and ("时间" in s or "日期" in s):
-                    return c
+    def _refresh_year_options(self, df):
+        filter_dt = self._get_filter_datetime(df)
+        years = (
+            filter_dt.dt.year.dropna()
+            .unique()
+            .astype(int)
+            .tolist()
+        )
+        years = sorted(set(years))
+        values = ["全部"] + [str(y) for y in years]
+        self.year_cb["values"] = values
+        current = (self.year_var.get() or "").strip()
+        if not current or current not in values:
+            self.year_var.set("全部")
 
-        for c in df.columns:
-            if c == "销号时间":
-                continue
-            s = str(c)
-            if "时间" in s or "日期" in s:
-                return c
+    def _choose_reference_date_column(self, df):
+        if df is None or df.empty:
+            return None
+        if not hasattr(df, "columns"):
+            return None
 
-        return None
+        candidates = self._get_date_candidate_columns(df)
+        if not candidates:
+            return None
+
+        best_col = None
+        best_key = None
+        for c in candidates:
+            dt = self._parse_datetime_series(df[c])
+            cnt = int(dt.notna().sum())
+            key = self._date_column_priority_key(c, cnt)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_col = c
+        return best_col
 
     def _get_filter_datetime(self, df):
         if df is None or df.empty:
@@ -1087,17 +1163,23 @@ class StatisticsPanel(ttk.Frame):
         close_dt = None
         if "销号时间" in df.columns:
             try:
-                close_dt = pd.to_datetime(df["销号时间"], errors="coerce")
+                close_dt = self._parse_datetime_series(df["销号时间"])
             except Exception:
                 close_dt = None
 
-        ref_col = self._choose_reference_date_column(df)
         ref_dt = None
-        if ref_col and ref_col in df.columns:
-            try:
-                ref_dt = pd.to_datetime(df[ref_col], errors="coerce")
-            except Exception:
-                ref_dt = None
+        candidates = self._get_date_candidate_columns(df)
+        if candidates:
+            parsed = []
+            for c in candidates:
+                dt = self._parse_datetime_series(df[c])
+                parsed.append((c, dt, int(dt.notna().sum())))
+            parsed.sort(key=lambda x: self._date_column_priority_key(x[0], x[2]))
+            for _, dt, _ in parsed:
+                if ref_dt is None:
+                    ref_dt = dt
+                else:
+                    ref_dt = ref_dt.where(ref_dt.notna(), dt)
 
         if close_dt is None and ref_dt is None:
             return pd.Series([pd.NaT] * len(df), index=df.index)
@@ -1951,7 +2033,7 @@ class App:
              lbl.pack(side=LEFT, padx=15)
 
     def run_sync_process_from_stats(self):
-        if messagebox.askyesno("确认", "是否检查并导入新增的Word文档？\n程序会根据Excel历史记录仅处理新增文件。"):
+        if messagebox.askyesno("确认", "是否同步 Word 文档？\n程序将：\n1. 导入新增的文档\n2. 清理已删除文档的记录"):
             self.run_process_thread(is_sync=True)
 
     # --- Actions ---
@@ -2054,7 +2136,7 @@ class App:
                 if success:
                     if is_sync:
                         self.root.after(0, lambda: self.stats_panel.load_data(force=True, silent=True))
-                        self.root.after(0, lambda: messagebox.showinfo("完成", "同步完成！如无新增Word文档则不会追加数据。"))
+                        self.root.after(0, lambda: messagebox.showinfo("完成", "同步完成！已导入新增文档并清理无效记录。"))
                     else:
                         self.root.after(0, lambda: messagebox.showinfo("完成", "数据采集处理完成！\n请切换到“统计分析”查看结果。"))
                 else:

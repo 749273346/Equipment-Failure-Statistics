@@ -1,7 +1,7 @@
 ﻿#define MyAppName "设备故障统计"
 #define MyAppVersion "1.0"
 #define MyAppPublisher "QC-攻关小组"
-#define MyAppExeName "DeviceFaultStats.exe"
+#define MyAppExeName "DeviceDefectStats.exe"
 
 [Setup]
 ; NOTE: The value of AppId uniquely identifies this application. Do not use the same AppId value in installers for other applications.
@@ -16,7 +16,7 @@ DisableProgramGroupPage=yes
 ; Remove the following line to run in administrative install mode (install for all users.)
 PrivilegesRequired=lowest
 OutputDir=Install
-OutputBaseFilename=DeviceFaultStats_Setup
+OutputBaseFilename=DeviceFaultStats_Setup_v2
 SetupIconFile=app_icon.ico
 Compression=lzma
 SolidCompression=yes
@@ -30,7 +30,8 @@ Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkablealone
 
 [Files]
-Source: "dist\Output\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\DeviceDefectStats\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "app_icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Icons]
