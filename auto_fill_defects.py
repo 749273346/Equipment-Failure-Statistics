@@ -813,8 +813,8 @@ class StatisticsPanel(ttk.Frame):
         self.tree.heading("action", text="操作")
         
         self.tree.column("serial", width=60, anchor="center")
-        self.tree.column("location", width=250)
-        self.tree.column("type", width=150)
+        self.tree.column("location", width=250, anchor="center")
+        self.tree.column("type", width=150, anchor="center")
         self.tree.column("status", width=100, anchor="center")
         self.tree.column("date", width=150, anchor="center")
         self.tree.column("action", width=100, anchor="center")
@@ -1453,17 +1453,17 @@ class App:
         # Sidebar: Light gray background
         self.style.configure("Sidebar.TFrame", background="#F0F2F5")
         # Sidebar Button: Transparent by default, Pill shape active
-        self.style.configure("Sidebar.TButton", background="#F0F2F5", foreground="#444444", 
-                           borderwidth=0, focuscolor="#F0F2F5", font=("Microsoft YaHei UI", 13))
+        self.style.configure("Sidebar.TButton", background="#F0F2F5", foreground="#1D1D1F", 
+                           borderwidth=0, focuscolor="#F0F2F5", font=("Microsoft YaHei UI", 14, "bold"))
         
         self.style.configure("Active.Sidebar.TButton", background="#E4E6EB", foreground="#007AFF", 
-                           borderwidth=0, focuscolor="#E4E6EB", font=("Microsoft YaHei UI", 13, "bold"))
+                           borderwidth=0, focuscolor="#E4E6EB", font=("Microsoft YaHei UI", 14, "bold"))
 
-        self.style.configure("Sub.Sidebar.TButton", background="#F0F2F5", foreground="#666666", 
-                           borderwidth=0, focuscolor="#F0F2F5", font=("Microsoft YaHei UI", 10))
+        self.style.configure("Sub.Sidebar.TButton", background="#F0F2F5", foreground="#86868B", 
+                           borderwidth=0, focuscolor="#F0F2F5", font=("Microsoft YaHei UI", 12))
 
         self.style.configure("ActiveSub.Sidebar.TButton", background="#F0F2F5", foreground="#007AFF", 
-                           borderwidth=0, focuscolor="#F0F2F5", font=("Microsoft YaHei UI", 10, "bold"))
+                           borderwidth=0, focuscolor="#F0F2F5", font=("Microsoft YaHei UI", 12, "bold"))
 
         self.style.map("Sidebar.TButton",
                      background=[('active', '#E4E6EB'), ('selected', '#E4E6EB')],
@@ -1584,7 +1584,7 @@ class App:
             
         btn = ttk.Button(parent, text=f"  {text}", command=lambda: self.show_view(view_name),
                        style="Sidebar.TButton", cursor="hand2")
-        btn.pack(pady=2, fill=X)
+        btn.pack(pady=8, padx=12, fill=X, ipady=6)
         # Center alignment fix isn't needed with fill=X and compound, but anchor w works best
         try: btn.configure(anchor="w") 
         except: pass
@@ -1593,9 +1593,9 @@ class App:
             self.nav_btns[view_name] = btn
 
     def create_sub_nav_btn(self, text, command):
-        btn = ttk.Button(self.stats_sub_menu, text=f"  {text}", command=command,
+        btn = ttk.Button(self.stats_sub_menu, text=f"      {text}", command=command,
                        style="Sub.Sidebar.TButton", cursor="hand2")
-        btn.pack(pady=1, fill=X)
+        btn.pack(pady=4, padx=12, fill=X, ipady=4)
         try: btn.configure(anchor="w") 
         except: pass
         return btn
