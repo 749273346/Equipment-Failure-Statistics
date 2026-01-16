@@ -1,12 +1,14 @@
 import os
 import tempfile
+import tkinter as tk
 
 import openpyxl
+import ttkbootstrap as ttk
 
-from auto_fill_defects import DefectProcessor
+import auto_fill_defects as afd
 
 
-def main():
+def test_excel_write_rows():
     with tempfile.TemporaryDirectory() as d:
         excel_path = os.path.join(d, "test.xlsx")
         wb = openpyxl.Workbook()
@@ -19,7 +21,7 @@ def main():
         row_data = ["", "广州", "类型A", "地点A", "", "", "", "", "", "", "", "", "", long_path]
         row_data2 = ["", "深圳", "类型B", "地点B", "", "", "", "", "", "", "", "", "", long_path]
 
-        p = DefectProcessor(log_callback=lambda *_: None)
+        p = afd.DefectProcessor(log_callback=lambda *_: None)
         wrote = p._write_rows_to_excel(excel_path, [row_data])
         if wrote != 1:
             raise RuntimeError(f"写入条数异常: {wrote}")
@@ -56,6 +58,109 @@ def main():
         if str(ws3.cell(row=4, column=1).value) != "1":
             raise RuntimeError("刷新后序号异常")
 
+
+def test_undo_redo_pause():
+    with tempfile.TemporaryDirectory() as d:
+        excel_path = os.path.join(d, "undo_redo.xlsx")
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws["A1"] = "before"
+        wb.save(excel_path)
+
+        afd.messagebox.askyesno = lambda *args, **kwargs: True
+        afd.messagebox.showwarning = lambda *args, **kwargs: None
+        afd.messagebox.showerror = lambda *args, **kwargs: None
+        afd.messagebox.showinfo = lambda *args, **kwargs: None
+
+        root = ttk.Window(themename="cosmo")
+        try:
+            root.withdraw()
+        except Exception:
+            pass
+
+        app = afd.App(root)
+        app.stats_panel.load_data = lambda *args, **kwargs: None
+        if not hasattr(app.processor, "paused"):
+            raise RuntimeError("DefectProcessor 初始化未包含 paused 字段")
+        if app.processor.paused is not False:
+            raise RuntimeError("DefectProcessor.paused 初始值应为 False")
+
+        app.entry_dst.delete(0, tk.END)
+        app.entry_dst.insert(0, excel_path)
+
+        backup = app._create_backup()
+        if not backup or not os.path.exists(backup):
+            raise RuntimeError("初始备份创建失败")
+        app.undo_stack.append(backup)
+        app.redo_stack.clear()
+        app._update_action_buttons()
+
+        wb2 = openpyxl.load_workbook(excel_path)
+        ws2 = wb2.active
+        ws2["A1"] = "after"
+        wb2.save(excel_path)
+
+        app.perform_undo()
+        wb3 = openpyxl.load_workbook(excel_path)
+        if wb3.active["A1"].value != "before":
+            raise RuntimeError("撤销未恢复到上次导入前状态")
+        if app.redo_stack == []:
+            raise RuntimeError("撤销后redo栈为空")
+
+        app.perform_redo()
+        wb4 = openpyxl.load_workbook(excel_path)
+        if wb4.active["A1"].value != "after":
+            raise RuntimeError("恢复未恢复到撤销前状态")
+        if app.redo_stack:
+            raise RuntimeError("恢复后redo栈未清空")
+
+        app._is_processing = True
+        app.btn_pause.configure(state="normal")
+        app.processor.paused = False
+        app.toggle_pause()
+        if not app.processor.paused:
+            raise RuntimeError("暂停未生效")
+        if app.btn_pause.cget("text") != "▶ 继续":
+            raise RuntimeError("暂停按钮文字未切换到继续")
+
+        if not app.undo_stack:
+            backup_paused = app._create_backup()
+            if not backup_paused or not os.path.exists(backup_paused):
+                raise RuntimeError("暂停场景初始撤销栈为空且备份创建失败")
+            app.undo_stack.append(backup_paused)
+
+        app._update_action_buttons()
+        if app.btn_undo.instate(["disabled"]):
+            raise RuntimeError("暂停状态下撤销按钮应可用")
+
+        backup2 = app._create_backup()
+        if not backup2 or not os.path.exists(backup2):
+            raise RuntimeError("暂停场景备份创建失败")
+        app.undo_stack.append(backup2)
+
+        wb5 = openpyxl.load_workbook(excel_path)
+        ws5 = wb5.active
+        ws5["A1"] = "after2"
+        wb5.save(excel_path)
+
+        app.perform_undo()
+        wb6 = openpyxl.load_workbook(excel_path)
+        if wb6.active["A1"].value != "after":
+            raise RuntimeError("暂停状态下撤销未恢复到上次状态")
+        if app.processor.paused:
+            raise RuntimeError("暂停状态下执行撤销后应自动解除暂停")
+        if not app.btn_pause.instate(["disabled"]):
+            raise RuntimeError("暂停状态下执行撤销后应禁用暂停按钮以停止当前处理")
+
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def main():
+    test_excel_write_rows()
+    test_undo_redo_pause()
     print("OK")
 
 

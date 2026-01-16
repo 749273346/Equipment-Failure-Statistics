@@ -78,6 +78,7 @@ class DefectProcessor:
         self.log = log_callback
         self.progress = progress_callback
         self.stop_requested = False
+        self.paused = False
 
     def _safe_temp_name(self, name):
         s = str(name or "")
@@ -441,6 +442,11 @@ class DefectProcessor:
             consecutive_rpc_failures = 0
 
             for i, file_path in enumerate(word_files):
+                while getattr(self, "paused", False):
+                    if self.stop_requested:
+                        break
+                    time.sleep(0.1)
+
                 if self.stop_requested:
                     self.log("用户停止了操作。")
                     break
@@ -1216,6 +1222,17 @@ class App:
         self._saved_source_path = self._app_state.get("source_path") or DEFAULT_SOURCE_DIR
         self._processing_lock = threading.Lock()
         self._is_processing = False
+        self._cancel_reason = None
+        
+        # Undo/Redo/Pause state
+        self.undo_stack = []
+        self.redo_stack = []
+        self._backup_dir = os.path.join(tempfile.gettempdir(), "defect_stats_backups")
+        if not os.path.exists(self._backup_dir):
+            try:
+                os.makedirs(self._backup_dir, exist_ok=True)
+            except Exception:
+                pass
 
         try:
             self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -1373,6 +1390,134 @@ class App:
         except Exception:
             pass
 
+    def _create_backup(self):
+        target_path = self.entry_dst.get()
+        if not os.path.exists(target_path):
+            return None
+        
+        timestamp = int(time.time() * 1000)
+        backup_name = f"backup_{timestamp}.xlsx"
+        backup_path = os.path.join(self._backup_dir, backup_name)
+        try:
+            shutil.copy2(target_path, backup_path)
+            return backup_path
+        except Exception as e:
+            self.log_message(f"备份失败: {e}")
+            return None
+
+    def perform_undo(self):
+        if not self.undo_stack:
+            return
+        
+        if self._is_processing and not getattr(self.processor, "paused", False):
+            messagebox.showwarning("提示", "正在处理中，无法撤销。")
+            return
+
+        if not messagebox.askyesno("撤销", "确定要撤销上一次操作吗？\n这将恢复Excel文件到处理前的状态。"):
+            return
+
+        try:
+            if self._is_processing and getattr(self.processor, "paused", False):
+                self._cancel_reason = "撤销"
+                self.processor.stop_requested = True
+                self.processor.paused = False
+                try:
+                    self.btn_pause.configure(state="disabled", text="⏸ 暂停", bootstyle="warning")
+                except Exception:
+                    pass
+
+            # Save current state to redo stack
+            current_backup = self._create_backup()
+            if current_backup:
+                self.redo_stack.append(current_backup)
+            
+            # Restore from undo stack
+            restore_path = self.undo_stack.pop()
+            target_path = self.entry_dst.get()
+            
+            # Ensure target directory exists just in case
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            
+            shutil.copy2(restore_path, target_path)
+            
+            self.log_message("已撤销上一次操作。")
+            self._update_action_buttons()
+            
+            # Refresh stats if available
+            if hasattr(self, "stats_panel"):
+                self.stats_panel.load_data(force=True, silent=True)
+                
+        except Exception as e:
+            messagebox.showerror("错误", f"撤销失败: {e}")
+
+    def perform_redo(self):
+        if not self.redo_stack:
+            return
+
+        if self._is_processing and not getattr(self.processor, "paused", False):
+            messagebox.showwarning("提示", "正在处理中，无法恢复。")
+            return
+            
+        if not messagebox.askyesno("恢复", "确定要恢复撤销的操作吗？"):
+            return
+
+        try:
+            if self._is_processing and getattr(self.processor, "paused", False):
+                self._cancel_reason = "恢复"
+                self.processor.stop_requested = True
+                self.processor.paused = False
+                try:
+                    self.btn_pause.configure(state="disabled", text="⏸ 暂停", bootstyle="warning")
+                except Exception:
+                    pass
+
+            # Save current state to undo stack
+            current_backup = self._create_backup()
+            if current_backup:
+                self.undo_stack.append(current_backup)
+                
+            # Restore from redo stack
+            restore_path = self.redo_stack.pop()
+            target_path = self.entry_dst.get()
+            shutil.copy2(restore_path, target_path)
+            
+            self.log_message("已恢复撤销的操作。")
+            self._update_action_buttons()
+            
+            if hasattr(self, "stats_panel"):
+                self.stats_panel.load_data(force=True, silent=True)
+                
+        except Exception as e:
+            messagebox.showerror("错误", f"恢复失败: {e}")
+
+    def toggle_pause(self):
+        if not self._is_processing:
+            return
+            
+        if not hasattr(self.processor, "paused"):
+            self.processor.paused = False
+        self.processor.paused = not self.processor.paused
+        if self.processor.paused:
+            self.btn_pause.configure(text="▶ 继续", bootstyle="info")
+            self.log_message("已暂停处理...")
+        else:
+            self.btn_pause.configure(text="⏸ 暂停", bootstyle="warning")
+            self.log_message("继续处理...")
+        self._update_action_buttons()
+            
+    def _update_action_buttons(self):
+        allow = (not self._is_processing) or getattr(self.processor, "paused", False)
+        state_undo = "normal" if self.undo_stack and allow else "disabled"
+        state_redo = "normal" if self.redo_stack and allow else "disabled"
+        
+        try:
+            if hasattr(self, "btn_undo"):
+                self.btn_undo.configure(state=state_undo)
+            if hasattr(self, "btn_redo"):
+                self.btn_redo.configure(state=state_redo)
+        except Exception:
+            pass
+
     def create_collect_view(self):
         view = ttk.Frame(self.content_container)
         self.views["collect"] = view
@@ -1415,15 +1560,33 @@ class App:
         action_frame = ttk.Frame(view, padding=10)
         action_frame.pack(fill=X, pady=10)
         
-        self.btn_run = ttk.Button(action_frame, text="▶ 开始处理", command=self.run_process_thread, bootstyle="success", width=20)
-        self.btn_run.pack(side=LEFT)
+        # Left: Control Buttons
+        ctl_frame = ttk.Frame(action_frame)
+        ctl_frame.pack(side=LEFT)
         
+        self.btn_run = ttk.Button(ctl_frame, text="▶ 开始处理", command=self.run_process_thread, bootstyle="success", width=12)
+        self.btn_run.pack(side=LEFT, padx=(0, 5))
+        
+        self.btn_pause = ttk.Button(ctl_frame, text="⏸ 暂停", command=self.toggle_pause, bootstyle="warning", width=8, state="disabled")
+        self.btn_pause.pack(side=LEFT, padx=5)
+        
+        # Center: Progress (Use pack expand)
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(action_frame, variable=self.progress_var, maximum=100, bootstyle="success-striped")
-        self.progress_bar.pack(side=LEFT, fill=X, expand=YES, padx=20)
+        self.progress_bar.pack(side=LEFT, fill=X, expand=YES, padx=10)
+        
+        # Right: Undo/Redo & Status
+        right_frame = ttk.Frame(action_frame)
+        right_frame.pack(side=RIGHT)
+        
+        self.btn_undo = ttk.Button(right_frame, text="↶ 撤销", command=self.perform_undo, bootstyle="secondary-outline", width=8, state="disabled")
+        self.btn_undo.pack(side=LEFT, padx=5)
+        
+        self.btn_redo = ttk.Button(right_frame, text="↷ 恢复", command=self.perform_redo, bootstyle="secondary-outline", width=8, state="disabled")
+        self.btn_redo.pack(side=LEFT, padx=5)
         
         self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(action_frame, textvariable=self.status_var).pack(side=RIGHT)
+        ttk.Label(right_frame, textvariable=self.status_var).pack(side=LEFT, padx=(10, 0))
         
         # Log Card
         ttk.Label(view, text="运行日志", font=("Microsoft YaHei UI", 12)).pack(anchor=W, pady=(20, 5))
@@ -1568,9 +1731,21 @@ class App:
                 messagebox.showinfo("提示", "当前正在处理，请稍候完成后再操作。")
                 return
             self._is_processing = True
+
+        self._cancel_reason = None
+        self.processor.stop_requested = False
+        self.processor.paused = False
+        
+        # Create Backup
+        backup_path = self._create_backup()
+        if backup_path:
+            self.undo_stack.append(backup_path)
+            self.redo_stack.clear()
+            self.root.after(0, self._update_action_buttons)
         
         try:
             self.btn_run.config(state='disabled')
+            self.btn_pause.config(state='normal')
         except Exception:
             pass
         try:
@@ -1600,7 +1775,11 @@ class App:
                     else:
                         self.root.after(0, lambda: messagebox.showinfo("完成", "数据采集处理完成！\n请切换到“统计分析”查看结果。"))
                 else:
-                    self.root.after(0, lambda: messagebox.showerror("失败", "处理过程中遇到错误，请检查日志。"))
+                    if self._cancel_reason:
+                        msg = f"已{self._cancel_reason}，并停止当前处理。"
+                        self.root.after(0, lambda m=msg: messagebox.showinfo("已停止", m))
+                    else:
+                        self.root.after(0, lambda: messagebox.showerror("失败", "处理过程中遇到错误，请检查日志。"))
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("异常", str(e)))
             finally:
@@ -1609,6 +1788,9 @@ class App:
                         self._is_processing = False
                     try:
                         self.btn_run.config(state='normal')
+                        self.btn_pause.configure(state="disabled", text="⏸ 暂停", bootstyle="warning")
+                        self.processor.paused = False
+                        self.processor.stop_requested = False
                     except Exception:
                         pass
                     try:
@@ -1620,6 +1802,8 @@ class App:
                         self.status_var.set("就绪")
                     except Exception:
                         pass
+                    self._cancel_reason = None
+                    self._update_action_buttons()
 
                 self.root.after(0, finish)
 
