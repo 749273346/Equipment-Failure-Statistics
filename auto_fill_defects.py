@@ -614,7 +614,7 @@ class StatisticsPanel(ttk.Frame):
 
     def setup_ui(self):
         # Top Control Bar (Filter & Actions)
-        control_frame = ttk.Frame(self, padding=10)
+        control_frame = ttk.Frame(self, padding=5)
         control_frame.pack(fill=X)
         
         # Load Button
@@ -652,10 +652,10 @@ class StatisticsPanel(ttk.Frame):
 
         # Content Area
         self.content_area = ttk.Frame(self)
-        self.content_area.pack(fill=BOTH, expand=YES, pady=10)
+        self.content_area.pack(fill=BOTH, expand=YES, pady=0)
         
         # View 1: Dashboard
-        self.view_dashboard = ttk.Frame(self.content_area, padding=10)
+        self.view_dashboard = ttk.Frame(self.content_area, padding=5)
         self.setup_dashboard_tab(self.view_dashboard)
         
         # View 2: Detail List
@@ -681,7 +681,7 @@ class StatisticsPanel(ttk.Frame):
     def setup_dashboard_tab(self, parent):
         # Summary Cards (Top)
         self.cards_frame = ttk.Frame(parent)
-        self.cards_frame.pack(fill=X, pady=10)
+        self.cards_frame.pack(fill=X, pady=5)
         
         self.card_total = self.create_card(self.cards_frame, "缺陷总数", "0", "info")
         self.card_open = self.create_card(self.cards_frame, "未销号", "0", "danger")
@@ -689,7 +689,7 @@ class StatisticsPanel(ttk.Frame):
         
         # Charts Area (Middle)
         self.charts_frame = ttk.Frame(parent)
-        self.charts_frame.pack(fill=BOTH, expand=YES, pady=10)
+        self.charts_frame.pack(fill=BOTH, expand=YES, pady=5)
         
         self.fig = Figure(figsize=(10, 5), dpi=100, constrained_layout=True)
         self.fig.patch.set_facecolor('#F8F9FA') # Match light theme bg roughly
@@ -727,8 +727,8 @@ class StatisticsPanel(ttk.Frame):
         
         self.tree.bind("<Double-1>", self.on_tree_double_click)
         
-        # Tooltip or instructions
-        ttk.Label(parent, text="💡 双击条目可打开原始Word文档", bootstyle="info").pack(side=BOTTOM, fill=X, padx=5, pady=2)
+        # Tooltip or instructions removed as per user request
+
 
     def on_sync(self):
         if self.app:
@@ -1198,7 +1198,7 @@ class App:
         self.chk_theme.pack(side=BOTTOM, pady=20)
         
         # 2. Content Area
-        self.content_container = ttk.Frame(self.root, padding=20)
+        self.content_container = ttk.Frame(self.root, padding=5)
         self.content_container.pack(side=RIGHT, fill=BOTH, expand=YES)
         
         # Views Container
