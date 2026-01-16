@@ -686,6 +686,12 @@ class StatisticsPanel(ttk.Frame):
         self._redraw_last = None
         self._layout_mode = None
         self.file_path_map = {}
+        
+        # List View State
+        self.list_data_source = None
+        self.sort_col = None
+        self.sort_reverse = False
+        
         self.setup_ui()
 
     def setup_ui(self):
@@ -718,13 +724,32 @@ class StatisticsPanel(ttk.Frame):
         self.month_cb.pack(side=LEFT)
         self.month_cb.bind("<<ComboboxSelected>>", self.apply_filter)
         
-        # Export Button
-        self.btn_export = ttk.Button(control_frame, text="📤 导出图表", command=self.export_chart, bootstyle=OUTLINE, state="disabled")
-        self.btn_export.pack(side=RIGHT)
+        # Status Filter
+        ttk.Label(control_frame, text="状态:").pack(side=LEFT, padx=5)
+        self.status_filter_var = tk.StringVar(value="全部状态")
+        self.cb_status = ttk.Combobox(control_frame, textvariable=self.status_filter_var, 
+                                    values=["全部状态", "未销号", "已销号"], width=10, state="readonly")
+        self.cb_status.pack(side=LEFT, padx=5)
+        self.cb_status.bind("<<ComboboxSelected>>", lambda e: self.refresh_tree_view())
+        
+        # Search
+        ttk.Label(control_frame, text="搜索:").pack(side=LEFT, padx=5)
+        self.search_var = tk.StringVar()
+        self.entry_search = ttk.Entry(control_frame, textvariable=self.search_var, width=20)
+        self.entry_search.pack(side=LEFT, padx=5)
+        self.entry_search.bind("<Return>", lambda e: self.refresh_tree_view())
+        
+        # Buttons
+        ttk.Button(control_frame, text="🔍 查询", command=self.refresh_tree_view, bootstyle="info-outline").pack(side=LEFT, padx=5)
+        ttk.Button(control_frame, text="🔄 重置", command=self.reset_list_filters, bootstyle="secondary-outline").pack(side=LEFT, padx=5)
 
         # Status Label
         self.lbl_status = ttk.Label(control_frame, text="请先加载数据", bootstyle=SECONDARY)
         self.lbl_status.pack(side=LEFT, padx=20)
+        
+        # Export Button
+        self.btn_export = ttk.Button(control_frame, text="📤 导出图表", command=self.export_chart, bootstyle=OUTLINE, state="disabled")
+        self.btn_export.pack(side=RIGHT)
 
         # Content Area
         self.content_area = ttk.Frame(self)
@@ -776,15 +801,15 @@ class StatisticsPanel(ttk.Frame):
         self.after(0, self._sync_figure_dpi_to_tk)
 
     def setup_details_tab(self, parent):
-        # Treeview
+        # --- Treeview ---
         columns = ("serial", "location", "type", "status", "date", "action")
         self.tree = ttk.Treeview(parent, columns=columns, show="headings", bootstyle="primary")
         
-        self.tree.heading("serial", text="序号")
-        self.tree.heading("location", text="设备缺陷地点")
-        self.tree.heading("type", text="设备缺陷类型")
-        self.tree.heading("status", text="状态")
-        self.tree.heading("date", text="销号时间")
+        self.tree.heading("serial", text="序号", command=lambda: self.on_sort_column("serial"))
+        self.tree.heading("location", text="设备缺陷地点", command=lambda: self.on_sort_column("location"))
+        self.tree.heading("type", text="设备缺陷类型", command=lambda: self.on_sort_column("type"))
+        self.tree.heading("status", text="状态", command=lambda: self.on_sort_column("status"))
+        self.tree.heading("date", text="销号时间", command=lambda: self.on_sort_column("date"))
         self.tree.heading("action", text="操作")
         
         self.tree.column("serial", width=60, anchor="center")
@@ -795,13 +820,26 @@ class StatisticsPanel(ttk.Frame):
         self.tree.column("action", width=100, anchor="center")
         
         # Scrollbar
-        vsb = ttk.Scrollbar(parent, orient="vertical", command=self.tree.yview)
+        vsb = ttk.Scrollbar(parent, orient="vertical", command=self.tree.yview, bootstyle="round")
         self.tree.configure(yscrollcommand=vsb.set)
         
         self.tree.pack(side=LEFT, fill=BOTH, expand=YES)
         vsb.pack(side=RIGHT, fill=Y)
         
         self.tree.bind("<Double-1>", self.on_tree_double_click)
+
+        # Optimize Mouse Wheel Scrolling
+        def _on_mousewheel(event):
+            try:
+                # Windows: event.delta is usually 120/-120
+                # Accelerate scrolling speed (factor of 3)
+                delta = int(-1 * (event.delta / 120) * 3)
+                self.tree.yview_scroll(delta, "units")
+            except Exception:
+                pass
+            return "break"
+
+        self.tree.bind("<MouseWheel>", _on_mousewheel)
         
         # Tooltip or instructions removed as per user request
 
@@ -956,9 +994,16 @@ class StatisticsPanel(ttk.Frame):
             self._loaded_path = path
             self._loaded_mtime = mtime
             
-            # Extract Years for Filter
             self.df['销号时间'] = pd.to_datetime(self.df['销号时间'], errors='coerce')
-            years = sorted(self.df['销号时间'].dt.year.dropna().unique().astype(int).astype(str).tolist())
+            filter_dt = self._get_filter_datetime(self.df)
+            years = (
+                filter_dt.dt.year.dropna()
+                .unique()
+                .astype(int)
+                .astype(str)
+                .tolist()
+            )
+            years = sorted(years)
             self.year_cb['values'] = ["全部"] + years
             
             self.update_dashboard(self.df)
@@ -976,21 +1021,148 @@ class StatisticsPanel(ttk.Frame):
     def apply_filter(self, event=None):
         if self.df is None:
             return
-            
-        filtered_df = self.df.copy()
-        
-        year = self.year_var.get()
-        month_str = self.month_var.get()
-        
-        if year != "全部":
-            filtered_df = filtered_df[filtered_df['销号时间'].dt.year == int(year)]
-            
-        if month_str != "全部":
-            month = int(month_str.replace("月", ""))
-            filtered_df = filtered_df[filtered_df['销号时间'].dt.month == month]
-            
+
+        filtered_df = self.filter_dataframe(
+            self.df,
+            apply_date_filters=True,
+            apply_status_filter=False,
+            apply_search_filter=False,
+        )
         self.update_dashboard(filtered_df)
         self.request_redraw()
+
+    def _get_closed_mask(self, df):
+        if df is None or df.empty:
+            return pd.Series([], dtype=bool)
+        if '销号时间' not in df.columns:
+            return pd.Series([False] * len(df), index=df.index)
+        try:
+            return pd.to_datetime(df['销号时间'], errors='coerce').notna()
+        except Exception:
+            return df['销号时间'].notna()
+
+    def _choose_reference_date_column(self, df):
+        if df is None or df.empty:
+            return None
+        if not hasattr(df, "columns"):
+            return None
+
+        exact = [
+            "缺陷时间", "缺陷日期",
+            "发生时间", "发生日期",
+            "发现时间", "发现日期",
+            "登记时间", "登记日期",
+            "填报时间", "填报日期",
+            "上报时间", "上报日期",
+            "录入时间", "录入日期",
+            "创建时间", "创建日期",
+            "日期",
+        ]
+        for name in exact:
+            if name in df.columns and name != "销号时间":
+                return name
+
+        keyword_order = ["缺陷", "发生", "发现", "登记", "填报", "上报", "录入", "创建"]
+        for kw in keyword_order:
+            for c in df.columns:
+                if c == "销号时间":
+                    continue
+                s = str(c)
+                if kw in s and ("时间" in s or "日期" in s):
+                    return c
+
+        for c in df.columns:
+            if c == "销号时间":
+                continue
+            s = str(c)
+            if "时间" in s or "日期" in s:
+                return c
+
+        return None
+
+    def _get_filter_datetime(self, df):
+        if df is None or df.empty:
+            return pd.Series([], dtype="datetime64[ns]")
+
+        close_dt = None
+        if "销号时间" in df.columns:
+            try:
+                close_dt = pd.to_datetime(df["销号时间"], errors="coerce")
+            except Exception:
+                close_dt = None
+
+        ref_col = self._choose_reference_date_column(df)
+        ref_dt = None
+        if ref_col and ref_col in df.columns:
+            try:
+                ref_dt = pd.to_datetime(df[ref_col], errors="coerce")
+            except Exception:
+                ref_dt = None
+
+        if close_dt is None and ref_dt is None:
+            return pd.Series([pd.NaT] * len(df), index=df.index)
+        if close_dt is None:
+            return ref_dt
+        if ref_dt is None:
+            return close_dt
+        return close_dt.where(close_dt.notna(), ref_dt)
+
+    def filter_dataframe(
+        self,
+        df,
+        apply_date_filters=True,
+        apply_status_filter=True,
+        apply_search_filter=True,
+    ):
+        if df is None or df.empty:
+            return df
+
+        out = df.copy()
+        closed_mask = self._get_closed_mask(out)
+        filter_dt = self._get_filter_datetime(out)
+
+        if apply_date_filters:
+            year = (self.year_var.get() or "").strip()
+            month_str = (self.month_var.get() or "").strip()
+
+            if year and year != "全部":
+                try:
+                    y = int(year)
+                    out = out[filter_dt.dt.year == y]
+                    closed_mask = closed_mask.loc[out.index]
+                    filter_dt = filter_dt.loc[out.index]
+                except Exception:
+                    pass
+
+            if month_str and month_str != "全部":
+                try:
+                    m = int(month_str.replace("月", ""))
+                    out = out[filter_dt.dt.month == m]
+                    closed_mask = closed_mask.loc[out.index]
+                except Exception:
+                    pass
+
+        if apply_status_filter and not out.empty:
+            status = (self.status_filter_var.get() or "").strip()
+            if status == "未销号":
+                out = out[~closed_mask.loc[out.index]]
+            elif status == "已销号":
+                out = out[closed_mask.loc[out.index]]
+
+        if apply_search_filter and not out.empty:
+            query = (self.search_var.get() or "").strip()
+            if query:
+                searchable_cols = [c for c in ["序号", "设备缺陷地点", "设备缺陷类型", "销号时间"] if c in out.columns]
+                if searchable_cols:
+                    mask = pd.Series(False, index=out.index)
+                    for c in searchable_cols:
+                        try:
+                            mask = mask | out[c].astype(str).str.contains(query, case=False, na=False, regex=False)
+                        except Exception:
+                            pass
+                    out = out[mask]
+
+        return out
 
     def update_dashboard(self, df):
         # 1. Update Cards
@@ -1009,13 +1181,82 @@ class StatisticsPanel(ttk.Frame):
         self.update_detail_list(df)
 
     def update_detail_list(self, df):
+        self.list_data_source = df
+        self.refresh_tree_view()
+
+    def reset_list_filters(self):
+        self.search_var.set("")
+        self.status_filter_var.set("全部状态")
+        self.sort_col = None
+        self.sort_reverse = False
+        # Reset headers
+        for c in ["serial", "location", "type", "status", "date"]:
+            self.tree.heading(c, text=self.tree.heading(c, "text").replace(" ▲", "").replace(" ▼", ""))
+        self.refresh_tree_view()
+
+    def on_sort_column(self, col):
+        if self.sort_col == col:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_col = col
+            self.sort_reverse = False
+            
+        # Update heading indicators
+        for c in ["serial", "location", "type", "status", "date"]:
+            text = self.tree.heading(c, "text").replace(" ▲", "").replace(" ▼", "")
+            if c == self.sort_col:
+                text += " ▼" if self.sort_reverse else " ▲"
+            self.tree.heading(c, text=text)
+            
+        self.refresh_tree_view()
+
+    def refresh_tree_view(self):
         # Clear existing
         for item in self.tree.get_children():
             self.tree.delete(item)
         self.file_path_map.clear()
         
+        if self.list_data_source is None or self.list_data_source.empty:
+            return
+            
+        df = self.list_data_source.copy()
+
+        df = self.filter_dataframe(
+            df,
+            apply_date_filters=False,
+            apply_status_filter=True,
+            apply_search_filter=True,
+        )
         if df is None or df.empty:
             return
+            
+        # 2. Apply Sorting
+        if self.sort_col and not df.empty:
+            col_map = {
+                "serial": "序号",
+                "location": "设备缺陷地点",
+                "type": "设备缺陷类型",
+                "status": "销号时间",
+                "date": "销号时间"
+            }
+            
+            df_col = col_map.get(self.sort_col)
+            if df_col:
+                ascending = not self.sort_reverse
+                if self.sort_col == "serial":
+                    if '序号' in df.columns:
+                        try:
+                            df['__serial_sort'] = pd.to_numeric(df['序号'], errors='coerce')
+                            df = df.sort_values(by='__serial_sort', ascending=ascending)
+                        except:
+                            df = df.sort_values(by='序号', ascending=ascending)
+                    else:
+                        df = df.sort_index(ascending=ascending)
+                elif self.sort_col == "status":
+                     df['__is_closed'] = df['销号时间'].notna()
+                     df = df.sort_values(by='__is_closed', ascending=ascending)
+                else:
+                    df = df.sort_values(by=df_col, ascending=ascending, na_position='last')
 
         for index, row in df.iterrows():
             serial = ""
@@ -1203,11 +1444,33 @@ class StatisticsPanel(ttk.Frame):
 class App:
     def __init__(self, root):
         self.root = root
-        # Initialize Theme
-        self.style = ttk.Style(theme='cosmo')
+        # Initialize Theme with a cleaner base
+        self.style = ttk.Style(theme='litera')
         
+        # Configure Custom Styles for "High-End" Look
+        # Card Frame: White background, subtle border
+        self.style.configure("Card.TFrame", background="#FFFFFF", relief="flat", borderwidth=0)
+        # Sidebar: Light gray background
+        self.style.configure("Sidebar.TFrame", background="#F0F2F5")
+        # Sidebar Button: Transparent by default, Pill shape active
+        self.style.configure("Sidebar.TButton", background="#F0F2F5", foreground="#444444", 
+                           borderwidth=0, focuscolor="#F0F2F5", font=("Microsoft YaHei UI", 13))
+        
+        self.style.configure("Active.Sidebar.TButton", background="#E4E6EB", foreground="#007AFF", 
+                           borderwidth=0, focuscolor="#E4E6EB", font=("Microsoft YaHei UI", 13, "bold"))
+
+        self.style.configure("Sub.Sidebar.TButton", background="#F0F2F5", foreground="#666666", 
+                           borderwidth=0, focuscolor="#F0F2F5", font=("Microsoft YaHei UI", 10))
+
+        self.style.configure("ActiveSub.Sidebar.TButton", background="#F0F2F5", foreground="#007AFF", 
+                           borderwidth=0, focuscolor="#F0F2F5", font=("Microsoft YaHei UI", 10, "bold"))
+
+        self.style.map("Sidebar.TButton",
+                     background=[('active', '#E4E6EB'), ('selected', '#E4E6EB')],
+                     foreground=[('active', '#000000'), ('selected', '#007AFF')])
+
         self.root.title("设备缺陷统计管理系统 V2.0")
-        self.root.geometry("1100x750")
+        self.root.geometry("1200x800")
         
         # Default Maximized Window
         try:
@@ -1243,50 +1506,60 @@ class App:
         self.setup_ui()
 
     def setup_ui(self):
-        # 1. Sidebar
-        self.sidebar = ttk.Frame(self.root, bootstyle="secondary", padding=10)
+        # 1. Sidebar (Fixed width, full height)
+        self.sidebar = ttk.Frame(self.root, style="Sidebar.TFrame", padding=0, width=320)
         self.sidebar.pack(side=LEFT, fill=Y)
+        self.sidebar.pack_propagate(False) # Fix width
         
-        # App Title/Logo Area
-        ttk.Label(self.sidebar, text="📊 统计助手", font=("Microsoft YaHei UI", 20, "bold"), bootstyle="inverse-secondary").pack(pady=(20, 40))
+        # Brand Area
+        brand_frame = ttk.Frame(self.sidebar, style="Sidebar.TFrame", padding=(20, 30, 20, 30))
+        brand_frame.pack(fill=X)
+        ttk.Label(brand_frame, text="📊 统计助手", font=("Microsoft YaHei UI", 18, "bold"), 
+                 background="#F0F2F5", foreground="#333333").pack(anchor=W)
+        ttk.Label(brand_frame, text="设备故障智能分析平台", font=("Microsoft YaHei UI", 9), 
+                 background="#F0F2F5", foreground="#666666").pack(anchor=W, pady=(5, 0))
         
-        # Navigation Buttons
+        # Navigation Menu
+        self.nav_frame = ttk.Frame(self.sidebar, style="Sidebar.TFrame", padding=(10, 0))
+        self.nav_frame.pack(fill=BOTH, expand=YES)
+        
         self.nav_btns = {}
         self.create_nav_btn("数据采集", "collect", "📚")
         self.create_nav_btn("统计分析", "stats", "📈")
-        self.create_nav_btn("关于", "about", "ℹ️")
         
-        self.nav_separator = ttk.Separator(self.sidebar)
-        self.nav_separator.pack(fill=X, pady=20)
+        # Sub-menu for Stats (Hidden by default, styled seamlessly)
+        self.stats_sub_menu = ttk.Frame(self.nav_frame, style="Sidebar.TFrame")
         
-        # Sub-menu for Stats (Hidden by default)
-        self.stats_sub_menu = ttk.Frame(self.sidebar, bootstyle="secondary")
+        # Separator line
+        sep = ttk.Frame(self.stats_sub_menu, height=2, bootstyle="secondary")
+        sep.pack(fill=X, padx=0, pady=(0, 5))
+
+        self.btn_view_chart = self.create_sub_nav_btn("图表概览", lambda: self.switch_stats_view("chart"))
+        self.btn_view_list = self.create_sub_nav_btn("明细列表", lambda: self.switch_stats_view("list"))
         
-        # Sub-menu item 1: Charts
-        self.btn_view_chart = ttk.Button(self.stats_sub_menu, text="      📊    图表概览", 
-                                       command=lambda: self.switch_stats_view("chart"),
-                                       bootstyle="info-link", cursor="hand2")
-        self.btn_view_chart.pack(pady=2, fill=X, padx=(10, 10))
-        try: self.btn_view_chart.configure(anchor="w")
-        except: pass
+        # Spacer
+        ttk.Frame(self.nav_frame, style="Sidebar.TFrame").pack(fill=BOTH, expand=YES)
         
-        # Sub-menu item 2: List
-        self.btn_view_list = ttk.Button(self.stats_sub_menu, text="      📋    明细列表", 
-                                      command=lambda: self.switch_stats_view("list"),
-                                      bootstyle="secondary-link", cursor="hand2")
-        self.btn_view_list.pack(pady=2, fill=X, padx=(10, 10))
-        try: self.btn_view_list.configure(anchor="w")
-        except: pass
+        # Bottom Actions
+        bottom_frame = ttk.Frame(self.sidebar, style="Sidebar.TFrame", padding=20)
+        bottom_frame.pack(side=BOTTOM, fill=X)
         
-        # Theme Toggle
-        self.theme_var = tk.BooleanVar(value=False) # False=Light
-        self.chk_theme = ttk.Checkbutton(self.sidebar, text="深色模式", variable=self.theme_var, 
-                                       command=self.toggle_theme, bootstyle="round-toggle-inverse")
-        self.chk_theme.pack(side=BOTTOM, pady=20)
+        self.create_nav_btn("关于软件", "about", "ℹ️", parent=bottom_frame)
         
-        # 2. Content Area
-        self.content_container = ttk.Frame(self.root, padding=5)
-        self.content_container.pack(side=RIGHT, fill=BOTH, expand=YES)
+        # Theme Toggle (Switch style)
+        self.theme_var = tk.BooleanVar(value=False)
+        self.chk_theme = ttk.Checkbutton(bottom_frame, text="深色模式", variable=self.theme_var, 
+                                       command=self.toggle_theme, bootstyle="round-toggle")
+        self.chk_theme.pack(anchor=W, pady=(15, 0))
+        
+        # 2. Main Content Container (Right)
+        # Use a background color slightly different from white to show card edges
+        self.content_bg = ttk.Frame(self.root) 
+        self.content_bg.pack(side=RIGHT, fill=BOTH, expand=YES)
+        
+        # This frame holds the actual views with padding to create "Floating" effect
+        self.content_container = ttk.Frame(self.content_bg, padding=20)
+        self.content_container.pack(fill=BOTH, expand=YES)
         
         # Views Container
         self.views = {}
@@ -1305,35 +1578,38 @@ class App:
         # Show default
         self.show_view("collect")
 
-    def create_nav_btn(self, text, view_name, icon=""):
-        # Use more spaces for better separation and anchor w for alignment
-        btn = ttk.Button(self.sidebar, text=f"  {icon}    {text}", command=lambda: self.show_view(view_name),
-                       bootstyle="secondary-link", cursor="hand2")
-        btn.pack(pady=2, fill=X, padx=10) # fill=X ensures full width click area
-        # Configure internal alignment of text to the left
-        # Note: ttkbootstrap/ttk buttons alignment is handled by style or compound, 
-        # but simple text alignment in button is often centered. 
-        # We can try to force it via style or width.
-        # Actually, for link style, anchor in pack might not be enough for text inside.
-        # Let's use a standard button property if available or rely on pack fill.
-        # However, ttk.Button 'anchor' option controls text position inside the widget.
-        try:
-            btn.configure(anchor="w") 
-        except:
-            pass
+    def create_nav_btn(self, text, view_name, icon="", parent=None):
+        if parent is None:
+            parent = self.nav_frame
             
-        self.nav_btns[view_name] = btn
+        btn = ttk.Button(parent, text=f"  {text}", command=lambda: self.show_view(view_name),
+                       style="Sidebar.TButton", cursor="hand2")
+        btn.pack(pady=2, fill=X)
+        # Center alignment fix isn't needed with fill=X and compound, but anchor w works best
+        try: btn.configure(anchor="w") 
+        except: pass
+            
+        if view_name in ["collect", "stats", "about"]:
+            self.nav_btns[view_name] = btn
+
+    def create_sub_nav_btn(self, text, command):
+        btn = ttk.Button(self.stats_sub_menu, text=f"  {text}", command=command,
+                       style="Sub.Sidebar.TButton", cursor="hand2")
+        btn.pack(pady=1, fill=X)
+        try: btn.configure(anchor="w") 
+        except: pass
+        return btn
 
     def switch_stats_view(self, view_type):
         if hasattr(self, 'stats_panel'):
             self.stats_panel.switch_view(view_type)
-            # Update button styles
+            # Visual feedback
             if view_type == "chart":
-                self.btn_view_chart.configure(bootstyle="info-link")
-                self.btn_view_list.configure(bootstyle="secondary-link")
+                self.btn_view_chart.configure(style="ActiveSub.Sidebar.TButton")
+                self.btn_view_list.configure(style="Sub.Sidebar.TButton")
             else:
-                self.btn_view_chart.configure(bootstyle="secondary-link")
-                self.btn_view_list.configure(bootstyle="info-link")
+                self.btn_view_chart.configure(style="Sub.Sidebar.TButton")
+                self.btn_view_list.configure(style="ActiveSub.Sidebar.TButton")
 
     def show_view(self, view_name):
         # Hide all
@@ -1346,7 +1622,7 @@ class App:
             
         # Toggle Sub-menu
         if view_name == "stats":
-            self.stats_sub_menu.pack(after=self.nav_separator, fill=X, pady=(0, 10))
+            self.stats_sub_menu.pack(after=self.nav_btns["stats"], fill=X, pady=(0, 10))
             if hasattr(self, "stats_panel"):
                 def refresh_stats():
                     try:
@@ -1361,9 +1637,11 @@ class App:
         # Update Nav State (Visual feedback)
         for name, btn in self.nav_btns.items():
             if name == view_name:
-                btn.configure(bootstyle="light") # Active look
+                # Active State: Highlight background or text
+                btn.state(['pressed']) # Simulate pressed or use style map
+                btn.configure(style="Active.Sidebar.TButton") 
             else:
-                btn.configure(bootstyle="secondary-link")
+                btn.configure(style="Sidebar.TButton")
 
     def toggle_theme(self):
         if self.theme_var.get():
@@ -1523,74 +1801,80 @@ class App:
         self.views["collect"] = view
         
         # Header
-        ttk.Label(view, text="数据采集与处理", font=("Microsoft YaHei UI", 18)).pack(anchor=W, pady=(0, 20))
+        ttk.Label(view, text="数据采集与处理", font=("Microsoft YaHei UI", 24, "bold")).pack(anchor=W, pady=(0, 20))
         
-        # Config Card
-        config_frame = ttk.Labelframe(view, text="配置参数", padding=15, bootstyle="info")
-        config_frame.pack(fill=X, pady=10)
+        # Main Card
+        card = ttk.Frame(view, style="Card.TFrame", padding=30)
+        card.pack(fill=X)
         
-        grid = ttk.Frame(config_frame)
-        grid.pack(fill=X)
+        # Section 1: Source
+        src_frame = ttk.Frame(card, style="Card.TFrame")
+        src_frame.pack(fill=X, pady=(0, 20))
         
-        # Row 0: Source
-        ttk.Label(grid, text="数据源:").grid(row=0, column=0, sticky=W, pady=15)
-        self.entry_src = ttk.Entry(grid)
-        self.entry_src.grid(row=0, column=1, sticky=EW, padx=10)
+        ttk.Label(src_frame, text="数据源位置", font=("Microsoft YaHei UI", 12, "bold"), background="#FFFFFF", foreground="#000000").pack(anchor=W, pady=(0, 10))
+        
+        src_input_frame = ttk.Frame(src_frame, style="Card.TFrame")
+        src_input_frame.pack(fill=X)
+        
+        self.entry_src = ttk.Entry(src_input_frame, font=("Microsoft YaHei UI", 10))
+        self.entry_src.pack(side=LEFT, fill=X, expand=YES, padx=(0, 10), ipady=5)
         self.entry_src.insert(0, DEFAULT_SOURCE_DIR)
         
-        # Buttons Frame for Source (Align Right)
-        btn_frame_src = ttk.Frame(grid)
-        btn_frame_src.grid(row=0, column=2, sticky=E)
-        ttk.Button(btn_frame_src, text="📁 选文件夹", command=self.browse_folder, bootstyle="primary", width=12).pack(side=LEFT, padx=5)
-        ttk.Button(btn_frame_src, text="📄 选文件", command=self.browse_file, bootstyle="info", width=12).pack(side=LEFT, padx=5)
+        ttk.Button(src_input_frame, text="📁 选择文件夹", command=self.browse_folder, bootstyle="outline-primary").pack(side=LEFT, padx=5)
+        ttk.Button(src_input_frame, text="📄 选择文件", command=self.browse_file, bootstyle="outline-info").pack(side=LEFT, padx=5)
+
+        # Section 2: Target
+        dst_frame = ttk.Frame(card, style="Card.TFrame")
+        dst_frame.pack(fill=X, pady=(0, 20))
         
-        # Row 1: Target
-        ttk.Label(grid, text="目标Excel:").grid(row=1, column=0, sticky=W, pady=15)
-        self.entry_dst = ttk.Entry(grid, textvariable=self.excel_path_var)
-        self.entry_dst.grid(row=1, column=1, sticky=EW, padx=10)
+        ttk.Label(dst_frame, text="目标 Excel 文件", font=("Microsoft YaHei UI", 12, "bold"), background="#FFFFFF", foreground="#000000").pack(anchor=W, pady=(0, 10))
         
-        # Button for Target (Align Right, Wider to match above)
-        btn_frame_dst = ttk.Frame(grid)
-        btn_frame_dst.grid(row=1, column=2, sticky=E)
-        ttk.Button(btn_frame_dst, text="📂 选择Excel", command=self.browse_dst, bootstyle="warning", width=27).pack(side=LEFT, padx=5)
+        dst_input_frame = ttk.Frame(dst_frame, style="Card.TFrame")
+        dst_input_frame.pack(fill=X)
         
-        grid.columnconfigure(1, weight=1)
+        self.entry_dst = ttk.Entry(dst_input_frame, textvariable=self.excel_path_var, font=("Microsoft YaHei UI", 10))
+        self.entry_dst.pack(side=LEFT, fill=X, expand=YES, padx=(0, 10), ipady=5)
         
-        # Action Card
-        action_frame = ttk.Frame(view, padding=10)
-        action_frame.pack(fill=X, pady=10)
+        ttk.Button(dst_input_frame, text="📂 选择文件", command=self.browse_dst, bootstyle="outline-warning").pack(side=LEFT, padx=5)
+
+        # Section 3: Actions & Progress
+        action_frame = ttk.Frame(card, style="Card.TFrame")
+        action_frame.pack(fill=X, pady=(20, 0))
         
-        # Left: Control Buttons
-        ctl_frame = ttk.Frame(action_frame)
-        ctl_frame.pack(side=LEFT)
+        # Big Start Button
+        self.btn_run = ttk.Button(action_frame, text="▶ 开始处理", command=self.run_process_thread, bootstyle="primary", width=20)
+        self.btn_run.pack(side=LEFT, padx=(0, 15), ipady=5)
         
-        self.btn_run = ttk.Button(ctl_frame, text="▶ 开始处理", command=self.run_process_thread, bootstyle="success", width=12)
-        self.btn_run.pack(side=LEFT, padx=(0, 5))
+        self.btn_pause = ttk.Button(action_frame, text="⏸ 暂停", command=self.toggle_pause, bootstyle="warning-outline", width=10, state="disabled")
+        self.btn_pause.pack(side=LEFT, padx=5, ipady=5)
         
-        self.btn_pause = ttk.Button(ctl_frame, text="⏸ 暂停", command=self.toggle_pause, bootstyle="warning", width=8, state="disabled")
-        self.btn_pause.pack(side=LEFT, padx=5)
+        # Progress Bar (Modern & Thin)
+        progress_frame = ttk.Frame(action_frame, style="Card.TFrame")
+        progress_frame.pack(side=LEFT, fill=X, expand=YES, padx=20)
         
-        # Center: Progress (Use pack expand)
+        self.status_var = tk.StringVar(value="准备就绪")
+        ttk.Label(progress_frame, textvariable=self.status_var, background="#FFFFFF", foreground="#666666").pack(anchor=W)
+        
         self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(action_frame, variable=self.progress_var, maximum=100, bootstyle="success-striped")
-        self.progress_bar.pack(side=LEFT, fill=X, expand=YES, padx=10)
+        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100, bootstyle="success-striped")
+        self.progress_bar.pack(fill=X, pady=(5, 0))
+
+        # Undo/Redo
+        undo_frame = ttk.Frame(action_frame, style="Card.TFrame")
+        undo_frame.pack(side=RIGHT)
         
-        # Right: Undo/Redo & Status
-        right_frame = ttk.Frame(action_frame)
-        right_frame.pack(side=RIGHT)
-        
-        self.btn_undo = ttk.Button(right_frame, text="↶ 撤销", command=self.perform_undo, bootstyle="secondary-outline", width=8, state="disabled")
+        self.btn_undo = ttk.Button(undo_frame, text="↶ 撤销", command=self.perform_undo, bootstyle="secondary-outline", state="disabled", width=8)
         self.btn_undo.pack(side=LEFT, padx=5)
+        self.btn_redo = ttk.Button(undo_frame, text="↷ 重做", command=self.perform_redo, bootstyle="secondary-outline", state="disabled", width=8)
+        self.btn_redo.pack(side=LEFT)
+
+        # Log Section
+        log_frame = ttk.Frame(view, style="Card.TFrame", padding=20)
+        log_frame.pack(fill=BOTH, expand=YES, pady=(20, 0))
         
-        self.btn_redo = ttk.Button(right_frame, text="↷ 恢复", command=self.perform_redo, bootstyle="secondary-outline", width=8, state="disabled")
-        self.btn_redo.pack(side=LEFT, padx=5)
+        ttk.Label(log_frame, text="运行日志", font=("Microsoft YaHei UI", 12, "bold"), background="#FFFFFF", foreground="#000000").pack(anchor=W, pady=(0, 10))
         
-        self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(right_frame, textvariable=self.status_var).pack(side=LEFT, padx=(10, 0))
-        
-        # Log Card
-        ttk.Label(view, text="运行日志", font=("Microsoft YaHei UI", 12)).pack(anchor=W, pady=(20, 5))
-        self.log_area = ScrolledText(view, height=10, state='disabled', font=("Consolas", 9))
+        self.log_area = ScrolledText(log_frame, height=10, state='disabled', font=("Consolas", 10))
         self.log_area.pack(fill=BOTH, expand=YES)
 
     def create_stats_view(self):
@@ -1609,41 +1893,40 @@ class App:
         card = ttk.Frame(center_frame, bootstyle="secondary", padding=(40, 40))
         card.pack(anchor=CENTER, fill=X, padx=50)
         
-        # --- Top Section: Unit & Guidance ---
-        top_section = ttk.Frame(card, bootstyle="secondary")
-        top_section.pack(fill=X, pady=(0, 30))
-        
-        # Unit (Left)
-        unit_frame = ttk.Frame(top_section, bootstyle="secondary")
-        unit_frame.pack(side=LEFT, fill=X, expand=YES, anchor=N)
+        # Main Info Grid
+        info_grid = ttk.Frame(card, bootstyle="secondary")
+        info_grid.pack(fill=X, pady=(0, 0))
+        info_grid.columnconfigure(0, weight=1)
+        info_grid.columnconfigure(1, weight=1)
+
+        # Unit (Row 0, Col 0)
+        unit_frame = ttk.Frame(info_grid, bootstyle="secondary")
+        unit_frame.grid(row=0, column=0, sticky="nw", pady=(0, 30))
         
         ttk.Label(unit_frame, text="单位", font=("Microsoft YaHei UI", 16, "bold"), bootstyle="inverse-secondary").pack(anchor=W, pady=(0, 10))
         ttk.Label(unit_frame, text="惠州电务段汕头水电车间", font=("Microsoft YaHei UI", 14), bootstyle="inverse-secondary").pack(anchor=W)
 
-        # Technical Guidance (Right)
-        guide_frame = ttk.Frame(top_section, bootstyle="secondary")
-        guide_frame.pack(side=LEFT, fill=X, expand=YES, anchor=N, padx=(20, 0))
+        # Technical Guidance (Row 0, Col 1)
+        guide_frame = ttk.Frame(info_grid, bootstyle="secondary")
+        guide_frame.grid(row=0, column=1, sticky="nw", padx=(20, 0), pady=(0, 30))
         
         ttk.Label(guide_frame, text="技术指导", font=("Microsoft YaHei UI", 16, "bold"), bootstyle="inverse-secondary").pack(anchor=W, pady=(0, 10))
         ttk.Label(guide_frame, text="李海东、梁成欧、庄金旺、郭新城、洪映森", font=("Microsoft YaHei UI", 14), bootstyle="inverse-secondary").pack(anchor=W)
         
-        # Separator
-        ttk.Separator(card, bootstyle="secondary").pack(fill=X, pady=10)
-        
-        # --- Middle Section: Author & Contact ---
-        mid_section = ttk.Frame(card, bootstyle="secondary")
-        mid_section.pack(fill=X, pady=(30, 0))
+        # Separator (Row 1)
+        sep = ttk.Separator(info_grid, bootstyle="secondary")
+        sep.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 30))
 
-        # Author (Left)
-        author_frame = ttk.Frame(mid_section, bootstyle="secondary")
-        author_frame.pack(side=LEFT, fill=X, expand=YES, anchor=N)
+        # Author (Row 2, Col 0)
+        author_frame = ttk.Frame(info_grid, bootstyle="secondary")
+        author_frame.grid(row=2, column=0, sticky="nw")
         
         ttk.Label(author_frame, text="作者", font=("Microsoft YaHei UI", 16, "bold"), bootstyle="inverse-secondary").pack(anchor=W, pady=(0, 10))
         ttk.Label(author_frame, text="智轨先锋组", font=("Microsoft YaHei UI", 14), bootstyle="inverse-secondary").pack(anchor=W)
         
-        # Contact (Right)
-        contact_frame = ttk.Frame(mid_section, bootstyle="secondary")
-        contact_frame.pack(side=LEFT, fill=X, expand=YES, anchor=N, padx=(20, 0))
+        # Contact (Row 2, Col 1)
+        contact_frame = ttk.Frame(info_grid, bootstyle="secondary")
+        contact_frame.grid(row=2, column=1, sticky="nw", padx=(20, 0))
         
         ttk.Label(contact_frame, text="联系方式", font=("Microsoft YaHei UI", 16, "bold"), bootstyle="inverse-secondary").pack(anchor=W, pady=(0, 10))
         
