@@ -7,6 +7,7 @@ from tkinter import filedialog, messagebox
 import tempfile
 import shutil
 import json
+import subprocess
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from ttkbootstrap.scrolled import ScrolledText
@@ -310,9 +311,64 @@ class DefectProcessor:
             temp_dir_obj = tempfile.TemporaryDirectory()
             temp_dir = temp_dir_obj.name
 
-            word = win32com.client.DispatchEx("Word.Application")
-            word.Visible = False
-            word.DisplayAlerts = 0
+            def close_word(app):
+                if not app:
+                    return
+                try:
+                    app.Quit()
+                except Exception:
+                    pass
+
+            def kill_all_winword():
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/IM", "WINWORD.EXE"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                except Exception:
+                    pass
+
+            def create_word():
+                kill_all_winword()
+                app = win32com.client.DispatchEx("Word.Application")
+                try:
+                    app.Visible = False
+                except Exception:
+                    pass
+                try:
+                    app.DisplayAlerts = 0
+                except Exception:
+                    pass
+                try:
+                    app.AutomationSecurity = 3
+                except Exception:
+                    pass
+                return app
+
+            def is_rpc_unavailable(err):
+                try:
+                    args = getattr(err, "args", None)
+                    if args and len(args) >= 1 and int(args[0]) == -2147023174:
+                        return True
+                except Exception:
+                    pass
+                return False
+
+            def ensure_word_alive(app):
+                if not app:
+                    return False
+                try:
+                    _ = app.Version
+                    return True
+                except Exception:
+                    return False
+
+            word = create_word()
+            time.sleep(0.8)
+            consecutive_rpc_failures = 0
 
             for i, file_path in enumerate(word_files):
                 if self.stop_requested:
@@ -330,6 +386,12 @@ class DefectProcessor:
                 for attempt in range(3):
                     doc = None
                     try:
+                        if not ensure_word_alive(word):
+                            close_word(word)
+                            word = None
+                            word = create_word()
+                            time.sleep(0.8)
+
                         try:
                             doc = self._open_word_doc(word, file_path)
                         except Exception as e:
@@ -384,6 +446,19 @@ class DefectProcessor:
                                 doc.Close(False)
                         except Exception:
                             pass
+                        if is_rpc_unavailable(e):
+                            close_word(word)
+                            word = None
+                            kill_all_winword()
+                            time.sleep(1.2)
+                            try:
+                                word = create_word()
+                                time.sleep(0.8)
+                            except Exception:
+                                word = None
+                            consecutive_rpc_failures += 1
+                        else:
+                            consecutive_rpc_failures = 0
                         time.sleep(0.8)
 
                 if not success:
@@ -391,13 +466,93 @@ class DefectProcessor:
                         self.log(f"  错误: 无法读取文件 {file_name}")
                     else:
                         self.log(f"  错误: 无法读取文件 {file_name}（{type(last_error).__name__}: {last_error}）")
+
+                    if is_rpc_unavailable(last_error) or consecutive_rpc_failures >= 2:
+                        isolated_word = None
+                        isolated_doc = None
+                        isolated_error = None
+                        try:
+                            kill_all_winword()
+                            isolated_word = win32com.client.DispatchEx("Word.Application")
+                            try:
+                                isolated_word.Visible = False
+                            except Exception:
+                                pass
+                            try:
+                                isolated_word.DisplayAlerts = 0
+                            except Exception:
+                                pass
+                            try:
+                                isolated_word.AutomationSecurity = 3
+                            except Exception:
+                                pass
+                            time.sleep(0.8)
+
+                            try:
+                                isolated_doc = self._open_word_doc(isolated_word, file_path)
+                            except Exception:
+                                tmp_name = f"isolated_{i+1:04d}_{self._safe_temp_name(file_name)}"
+                                tmp_path = os.path.join(temp_dir, tmp_name)
+                                shutil.copy2(file_path, tmp_path)
+                                isolated_doc = self._open_word_doc(isolated_word, tmp_path)
+
+                            if isolated_doc.Tables.Count > 0:
+                                table = isolated_doc.Tables(1)
+                                row_count = table.Rows.Count
+                                if row_count > 1:
+                                    for r in range(2, row_count + 1):
+                                        row_data = []
+                                        try:
+                                            for c in range(1, 14):
+                                                try:
+                                                    cell_text = table.Cell(r, c).Range.Text
+                                                    cell_text = cell_text.replace('\r', '').replace('\x07', '').strip()
+                                                    row_data.append(cell_text)
+                                                except Exception:
+                                                    row_data.append("")
+
+                                            has_content = False
+                                            if len(row_data) > 1:
+                                                for cell in row_data[1:]:
+                                                    if cell.strip():
+                                                        has_content = True
+                                                        break
+                                            if has_content:
+                                                row_data.append(file_path)
+                                                extracted_rows.append(row_data)
+                                        except Exception:
+                                            pass
+                                    self.log(f"  修复: 已通过隔离模式读取 {file_name}")
+                                else:
+                                    self.log(f"  警告: {file_name} 表格行数不足")
+                            else:
+                                self.log(f"  警告: {file_name} 中没有表格")
+                        except Exception as e2:
+                            isolated_error = e2
+                        finally:
+                            try:
+                                if isolated_doc:
+                                    isolated_doc.Close(False)
+                            except Exception:
+                                pass
+                            try:
+                                if isolated_word:
+                                    isolated_word.Quit()
+                            except Exception:
+                                pass
+
+                        if isolated_error is not None:
+                            self.log(f"  错误: 隔离模式仍失败 {file_name}（{type(isolated_error).__name__}: {isolated_error}）")
         except Exception as e:
             self.log(f"错误: 读取Word时发生异常（{type(e).__name__}: {e}）")
             return False
         finally:
             try:
-                if word:
-                    word.Quit()
+                close_word(word)
+            except Exception:
+                pass
+            try:
+                kill_all_winword()
             except Exception:
                 pass
             try:
