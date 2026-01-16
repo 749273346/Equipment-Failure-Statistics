@@ -1,4 +1,4 @@
-; Inno Setup Script for Device Defect Statistics Tool
+﻿; Inno Setup Script for Device Defect Statistics Tool
 ; 建议使用 Inno Setup 6.0 或更高版本编译此脚本
 
 [Setup]
