@@ -4,10 +4,14 @@ import time
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
+import tempfile
+import shutil
+import json
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from ttkbootstrap.scrolled import ScrolledText
 import win32com.client
+import pythoncom
 import openpyxl
 from openpyxl.styles import Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -29,11 +33,83 @@ try:
 except:
     pass
 
+def _app_state_path():
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        base_dir = os.getcwd()
+    return os.path.join(base_dir, ".app_state.json")
+
+def _load_app_state():
+    path = _app_state_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+def _save_app_state(data):
+    path = _app_state_path()
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
 class DefectProcessor:
     def __init__(self, log_callback=print, progress_callback=None):
         self.log = log_callback
         self.progress = progress_callback
         self.stop_requested = False
+
+    def _safe_temp_name(self, name):
+        s = str(name or "")
+        for ch in ['\\', '/', ':', '*', '?', '"', '<', '>', '|', '：']:
+            s = s.replace(ch, "_")
+        s = s.strip()
+        return s or "word.doc"
+
+    def _open_word_doc(self, word, file_path):
+        open_kwargs = dict(
+            ReadOnly=True,
+            AddToRecentFiles=False,
+            ConfirmConversions=False,
+            Visible=False,
+            OpenAndRepair=True,
+        )
+        return word.Documents.Open(file_path, **open_kwargs)
+
+    def _load_processed_paths_from_excel(self, target_excel):
+        paths = set()
+        try:
+            wb = openpyxl.load_workbook(target_excel, read_only=True, data_only=True)
+            ws = wb.active
+            for row in ws.iter_rows(min_row=4, min_col=14, max_col=14, values_only=True):
+                v = row[0] if row else None
+                if not isinstance(v, str):
+                    continue
+                s = v.strip()
+                if not s:
+                    continue
+                paths.add(os.path.normcase(os.path.normpath(s)))
+            try:
+                wb.close()
+            except Exception:
+                pass
+        except Exception:
+            return set()
+        return paths
 
     def _row_has_content(self, row_data):
         if not row_data or len(row_data) <= 1:
@@ -175,7 +251,7 @@ class DefectProcessor:
         wb.save(target_excel)
         return wrote
 
-    def process_source(self, source_path, target_excel, overwrite=False):
+    def process_source(self, source_path, target_excel, overwrite=False, incremental=False):
         self.log(f"开始处理: {source_path}")
         
         if not os.path.exists(target_excel):
@@ -197,6 +273,24 @@ class DefectProcessor:
             self.log(f"错误: 找不到源文件或文件夹: {source_path}")
             return False
 
+        try:
+            word_files.sort()
+        except Exception:
+            pass
+
+        if incremental:
+            processed = self._load_processed_paths_from_excel(target_excel)
+            if processed:
+                before = len(word_files)
+                word_files = [p for p in word_files if os.path.normcase(os.path.normpath(p)) not in processed]
+                if not word_files:
+                    self.log("未发现新Word文档，无需同步。")
+                    if self.progress:
+                        self.progress(before, before, "完成")
+                    return True
+            else:
+                self.log("提示: 未能从Excel读取历史路径，将执行全量同步。")
+
         total_files = len(word_files)
         self.log(f"共发现 {total_files} 个Word文件。")
         
@@ -208,79 +302,113 @@ class DefectProcessor:
 
         # 2. Extract data
         extracted_rows = []
-        
-        for i, file_path in enumerate(word_files):
-            if self.stop_requested:
-                self.log("用户停止了操作。")
-                break
-            
-            file_name = os.path.basename(file_path)
-            self.log(f"正在读取 ({i+1}/{total_files}): {file_name}")
-            if self.progress:
-                self.progress(i, total_files, f"读取: {file_name}")
-            
-            # Retry logic
-            success = False
-            for attempt in range(2):
-                word = None
-                doc = None
-                try:
-                    word = win32com.client.Dispatch("Word.Application")
-                    word.Visible = False
-                    word.DisplayAlerts = 0
-                    
-                    doc = word.Documents.Open(file_path, ReadOnly=True, AddToRecentFiles=False)
-                    if doc.Tables.Count > 0:
-                        table = doc.Tables(1)
-                        row_count = table.Rows.Count
-                        if row_count > 1:
-                            for r in range(2, row_count + 1):
-                                row_data = []
-                                try:
-                                    for c in range(1, 14):
-                                        try:
-                                            cell_text = table.Cell(r, c).Range.Text
-                                            cell_text = cell_text.replace('\r', '').replace('\x07', '').strip()
-                                            row_data.append(cell_text)
-                                        except Exception:
-                                            row_data.append("")
-                                    
-                                    has_content = False
-                                    if len(row_data) > 1:
-                                        for cell in row_data[1:]:
-                                            if cell.strip():
-                                                has_content = True
-                                                break
-                                    
-                                    if has_content:
-                                        row_data.append(file_path)
-                                        extracted_rows.append(row_data)
-                                except Exception as e:
-                                    pass
-                        else:
-                            self.log(f"  警告: {file_name} 表格行数不足")
-                    else:
-                        self.log(f"  警告: {file_name} 中没有表格")
-                    
-                    doc.Close(False)
+
+        word = None
+        temp_dir_obj = None
+        try:
+            pythoncom.CoInitialize()
+            temp_dir_obj = tempfile.TemporaryDirectory()
+            temp_dir = temp_dir_obj.name
+
+            word = win32com.client.DispatchEx("Word.Application")
+            word.Visible = False
+            word.DisplayAlerts = 0
+
+            for i, file_path in enumerate(word_files):
+                if self.stop_requested:
+                    self.log("用户停止了操作。")
+                    break
+
+                file_name = os.path.basename(file_path)
+                self.log(f"正在读取 ({i+1}/{total_files}): {file_name}")
+                if self.progress:
+                    self.progress(i + 1, total_files, f"读取: {file_name}")
+
+                success = False
+                last_error = None
+
+                for attempt in range(3):
                     doc = None
-                    try: word.Quit()
-                    except: pass
-                    word = None
-                    success = True
-                    break 
-                    
-                except Exception as e:
                     try:
-                        if doc: doc.Close(False)
-                    except: pass
-                    try:
-                        if word: word.Quit()
-                    except: pass
-                    time.sleep(1)
-            
-            if not success:
-                self.log(f"  错误: 无法读取文件 {file_name}")
+                        try:
+                            doc = self._open_word_doc(word, file_path)
+                        except Exception as e:
+                            tmp_name = f"{i+1:04d}_{self._safe_temp_name(file_name)}"
+                            tmp_path = os.path.join(temp_dir, tmp_name)
+                            shutil.copy2(file_path, tmp_path)
+                            doc = self._open_word_doc(word, tmp_path)
+
+                        if doc.Tables.Count > 0:
+                            table = doc.Tables(1)
+                            row_count = table.Rows.Count
+                            if row_count > 1:
+                                for r in range(2, row_count + 1):
+                                    row_data = []
+                                    try:
+                                        for c in range(1, 14):
+                                            try:
+                                                cell_text = table.Cell(r, c).Range.Text
+                                                cell_text = cell_text.replace('\r', '').replace('\x07', '').strip()
+                                                row_data.append(cell_text)
+                                            except Exception:
+                                                row_data.append("")
+
+                                        has_content = False
+                                        if len(row_data) > 1:
+                                            for cell in row_data[1:]:
+                                                if cell.strip():
+                                                    has_content = True
+                                                    break
+
+                                        if has_content:
+                                            row_data.append(file_path)
+                                            extracted_rows.append(row_data)
+                                    except Exception:
+                                        pass
+                            else:
+                                self.log(f"  警告: {file_name} 表格行数不足")
+                        else:
+                            self.log(f"  警告: {file_name} 中没有表格")
+
+                        try:
+                            doc.Close(False)
+                        except Exception:
+                            pass
+                        doc = None
+                        success = True
+                        break
+                    except Exception as e:
+                        last_error = e
+                        try:
+                            if doc:
+                                doc.Close(False)
+                        except Exception:
+                            pass
+                        time.sleep(0.8)
+
+                if not success:
+                    if last_error is None:
+                        self.log(f"  错误: 无法读取文件 {file_name}")
+                    else:
+                        self.log(f"  错误: 无法读取文件 {file_name}（{type(last_error).__name__}: {last_error}）")
+        except Exception as e:
+            self.log(f"错误: 读取Word时发生异常（{type(e).__name__}: {e}）")
+            return False
+        finally:
+            try:
+                if word:
+                    word.Quit()
+            except Exception:
+                pass
+            try:
+                if temp_dir_obj:
+                    temp_dir_obj.cleanup()
+            except Exception:
+                pass
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
         if self.stop_requested:
             return False
@@ -317,6 +445,8 @@ class StatisticsPanel(ttk.Frame):
         self.excel_path = excel_path
         self.app = app_instance
         self.df = None
+        self._loaded_path = None
+        self._loaded_mtime = None
         self._resize_job = None
         self._last_canvas_size = None
         self._redraw_job = None
@@ -338,7 +468,8 @@ class StatisticsPanel(ttk.Frame):
         
         # Sync Button
         if self.app:
-            ttk.Button(control_frame, text="🔁 同步并刷新", command=self.on_sync, bootstyle=SUCCESS).pack(side=LEFT, padx=5)
+            self.btn_sync = ttk.Button(control_frame, text="🔁 同步并刷新", command=self.on_sync, bootstyle=SUCCESS)
+            self.btn_sync.pack(side=LEFT, padx=5)
         
         ttk.Separator(control_frame, orient=VERTICAL).pack(side=LEFT, padx=10, fill=Y)
 
@@ -568,19 +699,31 @@ class StatisticsPanel(ttk.Frame):
         lbl.pack(pady=5)
         return lbl
 
-    def load_data(self):
+    def load_data(self, force=False, silent=False):
         path = self.excel_path.get()
         if not os.path.exists(path):
-            messagebox.showerror("错误", "找不到Excel文件")
+            if not silent:
+                messagebox.showerror("错误", "找不到Excel文件")
             return
 
         try:
+            try:
+                mtime = os.path.getmtime(path)
+            except Exception:
+                mtime = None
+            if not force and self.df is not None and self._loaded_path == path and self._loaded_mtime == mtime:
+                self.lbl_status.config(text=f"数据已就绪: {time.strftime('%H:%M:%S')}")
+                self.request_redraw()
+                return
+
             df = pd.read_excel(path, header=2)
             required_cols = ['设备缺陷类型', '销号时间', '设备缺陷地点']
             if not all(col in df.columns for col in required_cols):
                 df = pd.read_excel(path) 
             
             self.df = df
+            self._loaded_path = path
+            self._loaded_mtime = mtime
             
             # Extract Years for Filter
             self.df['销号时间'] = pd.to_datetime(self.df['销号时间'], errors='coerce')
@@ -593,9 +736,11 @@ class StatisticsPanel(ttk.Frame):
             self.request_redraw()
             
         except PermissionError:
-             messagebox.showwarning("提示", "请关闭Excel文件后再读取")
+            if not silent:
+                messagebox.showwarning("提示", "请关闭Excel文件后再读取")
         except Exception as e:
-            messagebox.showerror("错误", str(e))
+            if not silent:
+                messagebox.showerror("错误", str(e))
 
     def apply_filter(self, event=None):
         if self.df is None:
@@ -840,8 +985,17 @@ class App:
             self.root.attributes('-zoomed', True)
 
         # Logic Components
+        self._app_state = _load_app_state()
         self.processor = DefectProcessor(self.log_message, self.update_progress)
-        self.excel_path_var = tk.StringVar(value=TARGET_EXCEL_PATH)
+        self.excel_path_var = tk.StringVar(value=self._app_state.get("excel_path") or TARGET_EXCEL_PATH)
+        self._saved_source_path = self._app_state.get("source_path") or DEFAULT_SOURCE_DIR
+        self._processing_lock = threading.Lock()
+        self._is_processing = False
+
+        try:
+            self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        except Exception:
+            pass
         
         # --- Layout: Sidebar (Left) + Content (Right) ---
         self.setup_ui()
@@ -858,21 +1012,29 @@ class App:
         self.nav_btns = {}
         self.create_nav_btn("数据采集", "collect", "📚")
         self.create_nav_btn("统计分析", "stats", "📈")
+        self.create_nav_btn("关于", "about", "ℹ️")
         
         self.nav_separator = ttk.Separator(self.sidebar)
         self.nav_separator.pack(fill=X, pady=20)
         
         # Sub-menu for Stats (Hidden by default)
         self.stats_sub_menu = ttk.Frame(self.sidebar, bootstyle="secondary")
-        self.btn_view_chart = ttk.Button(self.stats_sub_menu, text="📊 图表概览", 
-                                       command=lambda: self.switch_stats_view("chart"),
-                                       bootstyle="info-link", width=15, cursor="hand2")
-        self.btn_view_chart.pack(pady=2, anchor=W, padx=(25, 0))
         
-        self.btn_view_list = ttk.Button(self.stats_sub_menu, text="📋 明细列表", 
+        # Sub-menu item 1: Charts
+        self.btn_view_chart = ttk.Button(self.stats_sub_menu, text="      📊    图表概览", 
+                                       command=lambda: self.switch_stats_view("chart"),
+                                       bootstyle="info-link", cursor="hand2")
+        self.btn_view_chart.pack(pady=2, fill=X, padx=(10, 10))
+        try: self.btn_view_chart.configure(anchor="w")
+        except: pass
+        
+        # Sub-menu item 2: List
+        self.btn_view_list = ttk.Button(self.stats_sub_menu, text="      📋    明细列表", 
                                       command=lambda: self.switch_stats_view("list"),
-                                      bootstyle="secondary-link", width=15, cursor="hand2")
-        self.btn_view_list.pack(pady=2, anchor=W, padx=(25, 0))
+                                      bootstyle="secondary-link", cursor="hand2")
+        self.btn_view_list.pack(pady=2, fill=X, padx=(10, 10))
+        try: self.btn_view_list.configure(anchor="w")
+        except: pass
         
         # Theme Toggle
         self.theme_var = tk.BooleanVar(value=False) # False=Light
@@ -890,14 +1052,34 @@ class App:
         # Initialize Views
         self.create_collect_view()
         self.create_stats_view()
+        self.create_about_view()
+
+        try:
+            self.entry_src.delete(0, tk.END)
+            self.entry_src.insert(0, self._saved_source_path)
+        except Exception:
+            pass
         
         # Show default
         self.show_view("collect")
 
     def create_nav_btn(self, text, view_name, icon=""):
-        btn = ttk.Button(self.sidebar, text=f"{icon}  {text}", command=lambda: self.show_view(view_name),
-                       bootstyle="secondary-link", width=15, cursor="hand2")
-        btn.pack(pady=5, anchor=W)
+        # Use more spaces for better separation and anchor w for alignment
+        btn = ttk.Button(self.sidebar, text=f"  {icon}    {text}", command=lambda: self.show_view(view_name),
+                       bootstyle="secondary-link", cursor="hand2")
+        btn.pack(pady=2, fill=X, padx=10) # fill=X ensures full width click area
+        # Configure internal alignment of text to the left
+        # Note: ttkbootstrap/ttk buttons alignment is handled by style or compound, 
+        # but simple text alignment in button is often centered. 
+        # We can try to force it via style or width.
+        # Actually, for link style, anchor in pack might not be enough for text inside.
+        # Let's use a standard button property if available or rely on pack fill.
+        # However, ttk.Button 'anchor' option controls text position inside the widget.
+        try:
+            btn.configure(anchor="w") 
+        except:
+            pass
+            
         self.nav_btns[view_name] = btn
 
     def switch_stats_view(self, view_type):
@@ -926,6 +1108,7 @@ class App:
             if hasattr(self, "stats_panel"):
                 def refresh_stats():
                     try:
+                        self.stats_panel.load_data(silent=True)
                         self.stats_panel.request_redraw()
                     except Exception:
                         return
@@ -949,6 +1132,21 @@ class App:
         # Update charts if they exist
         if hasattr(self, 'stats_panel'):
             self.stats_panel.render_charts()
+
+    def on_close(self):
+        try:
+            state = {
+                "excel_path": self.entry_dst.get() if hasattr(self, "entry_dst") else self.excel_path_var.get(),
+                "source_path": self.entry_src.get() if hasattr(self, "entry_src") else DEFAULT_SOURCE_DIR,
+                "saved_at": time.time(),
+            }
+            _save_app_state(state)
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def create_collect_view(self):
         view = ttk.Frame(self.content_container)
@@ -1011,8 +1209,78 @@ class App:
         self.stats_panel = StatisticsPanel(self.content_container, self.excel_path_var, app_instance=self)
         self.views["stats"] = self.stats_panel
 
+    def create_about_view(self):
+        view = ttk.Frame(self.content_container)
+        self.views["about"] = view
+        
+        # Center container
+        center_frame = ttk.Frame(view)
+        center_frame.pack(expand=YES, fill=BOTH, padx=20, pady=20)
+        
+        # Card - Make it wider and more spacious
+        card = ttk.Frame(center_frame, bootstyle="secondary", padding=(40, 40))
+        card.pack(anchor=CENTER, fill=X, padx=50)
+        
+        # --- Top Section: Unit & Guidance ---
+        top_section = ttk.Frame(card, bootstyle="secondary")
+        top_section.pack(fill=X, pady=(0, 30))
+        
+        # Unit (Left)
+        unit_frame = ttk.Frame(top_section, bootstyle="secondary")
+        unit_frame.pack(side=LEFT, fill=X, expand=YES, anchor=N)
+        
+        ttk.Label(unit_frame, text="单位", font=("Microsoft YaHei UI", 16, "bold"), bootstyle="inverse-secondary").pack(anchor=W, pady=(0, 10))
+        ttk.Label(unit_frame, text="惠州电务段汕头水电车间", font=("Microsoft YaHei UI", 14), bootstyle="inverse-secondary").pack(anchor=W)
+
+        # Technical Guidance (Right)
+        guide_frame = ttk.Frame(top_section, bootstyle="secondary")
+        guide_frame.pack(side=LEFT, fill=X, expand=YES, anchor=N, padx=(20, 0))
+        
+        ttk.Label(guide_frame, text="技术指导", font=("Microsoft YaHei UI", 16, "bold"), bootstyle="inverse-secondary").pack(anchor=W, pady=(0, 10))
+        ttk.Label(guide_frame, text="李海东、梁成欧、庄金旺、郭新城、洪映森", font=("Microsoft YaHei UI", 14), bootstyle="inverse-secondary").pack(anchor=W)
+        
+        # Separator
+        ttk.Separator(card, bootstyle="secondary").pack(fill=X, pady=10)
+        
+        # --- Middle Section: Author & Contact ---
+        mid_section = ttk.Frame(card, bootstyle="secondary")
+        mid_section.pack(fill=X, pady=(30, 0))
+
+        # Author (Left)
+        author_frame = ttk.Frame(mid_section, bootstyle="secondary")
+        author_frame.pack(side=LEFT, fill=X, expand=YES, anchor=N)
+        
+        ttk.Label(author_frame, text="作者", font=("Microsoft YaHei UI", 16, "bold"), bootstyle="inverse-secondary").pack(anchor=W, pady=(0, 10))
+        ttk.Label(author_frame, text="智轨先锋组", font=("Microsoft YaHei UI", 14), bootstyle="inverse-secondary").pack(anchor=W)
+        
+        # Contact (Right)
+        contact_frame = ttk.Frame(mid_section, bootstyle="secondary")
+        contact_frame.pack(side=LEFT, fill=X, expand=YES, anchor=N, padx=(20, 0))
+        
+        ttk.Label(contact_frame, text="联系方式", font=("Microsoft YaHei UI", 16, "bold"), bootstyle="inverse-secondary").pack(anchor=W, pady=(0, 10))
+        
+        contact_grid = ttk.Frame(contact_frame, bootstyle="secondary")
+        contact_grid.pack(anchor=W)
+        
+        ttk.Label(contact_grid, text="电话: 19119383440", font=("Microsoft YaHei UI", 14), bootstyle="inverse-secondary").pack(side=LEFT, padx=(0, 20))
+        ttk.Label(contact_grid, text="微信: yh19119383440", font=("Microsoft YaHei UI", 14), bootstyle="inverse-secondary").pack(side=LEFT)
+
+        # --- Footer Section: Badges ---
+        footer = ttk.Frame(card, bootstyle="secondary")
+        footer.pack(fill=X, pady=(40, 0))
+        
+        badges = [("🚄 广铁定制版", "info"), ("🎨 个性化引擎", "warning"), ("🛡️ 本地存储", "primary")]
+        
+        # Center the badges
+        badge_container = ttk.Frame(footer, bootstyle="secondary")
+        badge_container.pack(anchor=CENTER)
+        
+        for text, style in badges:
+             lbl = ttk.Label(badge_container, text=f" {text} ", bootstyle=f"{style}-inverse", font=("Microsoft YaHei UI", 12))
+             lbl.pack(side=LEFT, padx=15)
+
     def run_sync_process_from_stats(self):
-        if messagebox.askyesno("确认", "是否立即重新扫描Word文档并更新统计数据？\n这可能需要一些时间。"):
+        if messagebox.askyesno("确认", "是否检查并导入新增的Word文档？\n程序会根据Excel历史记录仅处理新增文件。"):
             self.run_process_thread(is_sync=True)
 
     # --- Actions ---
@@ -1069,9 +1337,22 @@ class App:
     def run_process_thread(self, is_sync=False):
         src = self.entry_src.get()
         dst = self.entry_dst.get()
+
+        with self._processing_lock:
+            if self._is_processing:
+                messagebox.showinfo("提示", "当前正在处理，请稍候完成后再操作。")
+                return
+            self._is_processing = True
         
-        if not is_sync:
+        try:
             self.btn_run.config(state='disabled')
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "stats_panel") and hasattr(self.stats_panel, "btn_sync"):
+                self.stats_panel.btn_sync.config(state='disabled')
+        except Exception:
+            pass
         
         # Clear log
         try:
@@ -1086,11 +1367,11 @@ class App:
         
         def task():
             try:
-                success = self.processor.process_source(src, dst, overwrite=is_sync)
+                success = self.processor.process_source(src, dst, overwrite=False, incremental=is_sync)
                 if success:
                     if is_sync:
-                        self.root.after(0, lambda: self.stats_panel.load_data())
-                        self.root.after(0, lambda: messagebox.showinfo("完成", "同步完成，数据已更新！"))
+                        self.root.after(0, lambda: self.stats_panel.load_data(force=True, silent=True))
+                        self.root.after(0, lambda: messagebox.showinfo("完成", "同步完成！如无新增Word文档则不会追加数据。"))
                     else:
                         self.root.after(0, lambda: messagebox.showinfo("完成", "数据采集处理完成！\n请切换到“统计分析”查看结果。"))
                 else:
@@ -1098,9 +1379,24 @@ class App:
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("异常", str(e)))
             finally:
-                if not is_sync:
-                    self.root.after(0, lambda: self.btn_run.config(state='normal'))
-                self.root.after(0, lambda: self.status_var.set("就绪"))
+                def finish():
+                    with self._processing_lock:
+                        self._is_processing = False
+                    try:
+                        self.btn_run.config(state='normal')
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(self, "stats_panel") and hasattr(self.stats_panel, "btn_sync"):
+                            self.stats_panel.btn_sync.config(state='normal')
+                    except Exception:
+                        pass
+                    try:
+                        self.status_var.set("就绪")
+                    except Exception:
+                        pass
+
+                self.root.after(0, finish)
 
         threading.Thread(target=task, daemon=True).start()
 
