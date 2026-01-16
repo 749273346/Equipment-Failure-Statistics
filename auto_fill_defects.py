@@ -252,6 +252,56 @@ class DefectProcessor:
         wb.save(target_excel)
         return wrote
 
+    def _remove_rows_by_paths(self, target_excel, paths_to_remove):
+        if not paths_to_remove:
+            return 0
+        
+        try:
+            wb = openpyxl.load_workbook(target_excel)
+            ws = wb.active
+            
+            rows_to_delete = []
+            
+            # Scan all rows to find matches
+            # Data starts at row 4
+            for row in range(ws.max_row, 3, -1):
+                cell_val = ws.cell(row=row, column=14).value
+                if cell_val:
+                    s_val = str(cell_val).strip()
+                    if s_val:
+                        norm_val = os.path.normcase(os.path.normpath(s_val))
+                        if norm_val in paths_to_remove:
+                            rows_to_delete.append(row)
+            
+            if not rows_to_delete:
+                return 0
+            
+            self.log(f"发现 {len(rows_to_delete)} 条记录对应已删除的文件，正在清理...")
+            
+            for r in rows_to_delete:
+                ws.delete_rows(r, 1)
+                
+            # Re-serialize
+            serial = 0
+            for row in range(4, ws.max_row + 1):
+                has_any = False
+                for c in range(2, 14):
+                    v = ws.cell(row=row, column=c).value
+                    if v is not None and str(v).strip() != "":
+                        has_any = True
+                        break
+                
+                if has_any:
+                    serial += 1
+                    ws.cell(row=row, column=1).value = serial
+
+            wb.save(target_excel)
+            return len(rows_to_delete)
+            
+        except Exception as e:
+            self.log(f"清理删除文件数据时出错: {e}")
+            return 0
+
     def process_source(self, source_path, target_excel, overwrite=False, incremental=False):
         self.log(f"开始处理: {source_path}")
         
@@ -282,10 +332,25 @@ class DefectProcessor:
         if incremental:
             processed = self._load_processed_paths_from_excel(target_excel)
             if processed:
+                # 1. Handle deleted files
+                current_files_set = {os.path.normcase(os.path.normpath(p)) for p in word_files}
+                deleted_files = processed - current_files_set
+                
+                if deleted_files:
+                    self.log(f"发现 {len(deleted_files)} 个历史文件已被删除，正在同步清理Excel记录...")
+                    removed_count = self._remove_rows_by_paths(target_excel, deleted_files)
+                    self.log(f"已清理 {removed_count} 条无效记录。")
+
+                # 2. Handle new files
                 before = len(word_files)
                 word_files = [p for p in word_files if os.path.normcase(os.path.normpath(p)) not in processed]
+                
                 if not word_files:
-                    self.log("未发现新Word文档，无需同步。")
+                    if deleted_files:
+                        self.log("未发现新Word文档，同步完成。")
+                    else:
+                        self.log("未发现新Word文档，无需同步。")
+                    
                     if self.progress:
                         self.progress(before, before, "完成")
                     return True
