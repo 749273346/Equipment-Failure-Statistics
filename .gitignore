@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE
+.vscode/
+.idea/
+.trae/
+*.swp
+
+# Application Data
+.app_state.json
+*.log
+
+# Data Files (根据需要决定是否忽略，通常不建议上传包含敏感数据的Excel/Word)
+# 建议忽略原始数据文件夹和结果Excel，仅保留代码
+3-设备缺陷问题库及设备缺陷处理记录/
+*.xlsx
+*.doc
+*.docx
+~$*.doc
+~$*.docx
+
+# OS
+Thumbs.db
+Desktop.ini
