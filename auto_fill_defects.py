@@ -24,8 +24,17 @@ import datetime
 from copy import copy
 
 # Configuration
-DEFAULT_SOURCE_DIR = r"e:\QC-攻关小组\正在进行项目\设备故障统计\3-设备缺陷问题库及设备缺陷处理记录"
-TARGET_EXCEL_PATH = r"e:\QC-攻关小组\正在进行项目\设备故障统计\设备缺陷问题库（日常巡视、故障处理问题库，广供记-002汇总表，202601起）.xlsx"
+def get_base_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        return os.getcwd()
+
+BASE_DIR = get_base_dir()
+DEFAULT_SOURCE_DIR = os.path.join(BASE_DIR, "3-设备缺陷问题库及设备缺陷处理记录")
+TARGET_EXCEL_PATH = os.path.join(BASE_DIR, "设备缺陷问题库（日常巡视、故障处理问题库，广供记-002汇总表，202601起）.xlsx")
 
 # Enable High DPI support
 try:
@@ -35,11 +44,7 @@ except:
     pass
 
 def _app_state_path():
-    try:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-    except Exception:
-        base_dir = os.getcwd()
-    return os.path.join(base_dir, ".app_state.json")
+    return os.path.join(get_base_dir(), ".app_state.json")
 
 def _load_app_state():
     path = _app_state_path()
