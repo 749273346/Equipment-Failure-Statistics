@@ -11,7 +11,7 @@ import subprocess
 import winsound
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
-from ttkbootstrap.scrolled import ScrolledText
+from ttkbootstrap.widgets.scrolled import ScrolledText
 import win32com.client
 import pythoncom
 import openpyxl
