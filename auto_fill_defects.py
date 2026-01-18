@@ -1322,6 +1322,10 @@ class StatisticsPanel(ttk.Frame):
 
     def setup_details_tab(self, parent):
         # --- Treeview ---
+        # Increase row height for better readability
+        style = ttk.Style()
+        style.configure("Treeview", rowheight=30)
+
         columns = ("serial", "discovery_date", "location", "type", "status", "date", "action")
         self.tree = ttk.Treeview(parent, columns=columns, show="headings", bootstyle="primary")
         
