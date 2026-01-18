@@ -363,6 +363,231 @@ class DefectProcessor:
             self.log(f"清理删除文件数据时出错: {e}")
             return 0
 
+    def update_single_file(self, file_path, target_excel):
+        try:
+            pythoncom.CoInitialize()
+        except:
+            pass
+            
+        self.log(f"正在更新单个文件: {file_path}")
+        if not os.path.exists(file_path):
+            self.log(f"文件不存在: {file_path}")
+            return False
+
+        extracted_rows = []
+        word = None
+        doc = None
+        try:
+            try:
+                word = win32com.client.Dispatch("Word.Application")
+            except Exception:
+                try:
+                    word = win32com.client.Dispatch("Kwps.Application")
+                except Exception:
+                    word = win32com.client.Dispatch("Wps.Application")
+            
+            try:
+                doc = self._open_word_doc(word, file_path)
+            except Exception:
+                time.sleep(1)
+                doc = self._open_word_doc(word, file_path)
+
+            if doc.Tables.Count > 0:
+                table = doc.Tables(1)
+                row_count = table.Rows.Count
+                if row_count > 1:
+                    for r in range(2, row_count + 1):
+                        row_data = []
+                        try:
+                            for c in range(1, 14):
+                                try:
+                                    cell_text = table.Cell(r, c).Range.Text
+                                    cell_text = cell_text.replace('\r', '').replace('\x07', '').strip()
+                                    row_data.append(cell_text)
+                                except Exception:
+                                    row_data.append("")
+                            
+                            has_content = False
+                            if len(row_data) > 1:
+                                for cell in row_data[1:]:
+                                    if cell.strip():
+                                        has_content = True
+                                        break
+                            if has_content:
+                                row_data.append(file_path)
+                                extracted_rows.append(row_data)
+                        except Exception:
+                            pass
+        except Exception as e:
+            self.log(f"读取Word文件失败: {e}")
+            return False
+        finally:
+            if doc:
+                try:
+                    doc.Close(False)
+                except Exception:
+                    pass
+
+        try:
+            self._remove_rows_by_paths(target_excel, {os.path.normcase(os.path.normpath(file_path))})
+            if extracted_rows:
+                self._write_rows_to_excel(target_excel, extracted_rows, overwrite=False)
+            self._normalize_excel_rows(target_excel)
+            self.log("单文件更新完成。")
+            return True
+        except Exception as e:
+            self.log(f"写入Excel失败: {e}")
+            return False
+
+    def sync_word_from_excel(self, target_excel):
+        """
+        反向同步：将Excel中的数据更新到Word文档中
+        """
+        self.log("正在读取Excel数据以同步到Word...")
+        
+        try:
+            wb = openpyxl.load_workbook(target_excel, data_only=True)
+            ws = wb.active
+        except Exception as e:
+            self.log(f"无法读取Excel文件: {e}")
+            return False
+
+        # 1. Group data by file path
+        file_data_map = {}
+        count = 0
+        try:
+            for row in ws.iter_rows(min_row=4, values_only=True):
+                if not row: continue
+                # Column 14 (index 13) is file path
+                if len(row) < 14: continue
+                
+                path_val = row[13]
+                if not isinstance(path_val, str) or not path_val.strip():
+                    continue
+                
+                full_path = os.path.normpath(path_val.strip())
+                if full_path not in file_data_map:
+                    file_data_map[full_path] = []
+                
+                # Take first 13 columns (data columns)
+                # Ensure we have 13 elements
+                data = list(row[:13])
+                if len(data) < 13:
+                    data.extend([None] * (13 - len(data)))
+                
+                file_data_map[full_path].append(data)
+                count += 1
+        except Exception as e:
+            self.log(f"解析Excel数据失败: {e}")
+            return False
+
+        if not file_data_map:
+            self.log("Excel中没有有效的文件关联记录。")
+            return True
+
+        self.log(f"读取完成，共找到 {len(file_data_map)} 个文件，{count} 条记录。正在更新Word文档...")
+        
+        # 2. Update Word files
+        word = None
+        try:
+            pythoncom.CoInitialize()
+            try:
+                word = win32com.client.Dispatch("Word.Application")
+            except Exception:
+                try:
+                    word = win32com.client.Dispatch("Kwps.Application")
+                except Exception:
+                    word = win32com.client.Dispatch("Wps.Application")
+            
+            word.Visible = False
+            word.DisplayAlerts = False
+            
+            updated_count = 0
+            total_files = len(file_data_map)
+            
+            for idx, (file_path, rows_data) in enumerate(file_data_map.items()):
+                if self.progress:
+                    self.progress(idx, total_files, f"正在更新: {os.path.basename(file_path)}")
+                
+                if self.stop_requested:
+                    self.log("用户停止了同步。")
+                    break
+
+                if not os.path.exists(file_path):
+                    self.log(f"跳过不存在的文件: {file_path}")
+                    continue
+
+                doc = None
+                try:
+                    doc = self._open_word_doc(word, file_path)
+                    
+                    if doc.Tables.Count > 0:
+                        table = doc.Tables(1)
+                        # Word table rows start at 1, data usually starts at 2
+                        # rows_data is list of row values from Excel
+                        
+                        # Check if row counts match
+                        # table.Rows.Count includes header
+                        # So data rows in Word = table.Rows.Count - 1
+                        
+                        # We will overwrite existing rows. 
+                        # If Excel has more rows, we add rows.
+                        # If Excel has fewer rows, we delete rows? 
+                        # Deleting is dangerous. Let's just update existing and add if needed.
+                        
+                        current_word_rows = table.Rows.Count
+                        
+                        for i, row_vals in enumerate(rows_data):
+                            word_row_idx = i + 2 # Start at row 2
+                            
+                            if word_row_idx > table.Rows.Count:
+                                table.Rows.Add()
+                            
+                            for c_idx, val in enumerate(row_vals):
+                                # c_idx 0 (Serial) -> Word Col 1
+                                # Word columns are 1-based
+                                word_col = c_idx + 1
+                                if word_col > 13: break
+                                
+                                val_str = str(val) if val is not None else ""
+                                if val_str == "None": val_str = ""
+                                
+                                try:
+                                    # Assign text
+                                    # Note: Accessing Cell(r,c).Range.Text directly includes end-of-cell marker
+                                    # So we just set it.
+                                    table.Cell(word_row_idx, word_col).Range.Text = val_str
+                                except Exception as e:
+                                    # Cell might not exist if split/merged
+                                    pass
+                        
+                        doc.Save()
+                        updated_count += 1
+                    else:
+                        self.log(f"文件没有表格: {file_path}")
+                        
+                except Exception as e:
+                    self.log(f"更新文件失败 {file_path}: {e}")
+                finally:
+                    if doc:
+                        try:
+                            doc.Close(False)
+                        except Exception:
+                            pass
+                            
+            self.log(f"Word文档更新完成，共更新 {updated_count} 个文件。")
+            return True
+            
+        except Exception as e:
+            self.log(f"Word服务异常: {e}")
+            return False
+        finally:
+            if word:
+                try:
+                    word.Quit()
+                except Exception:
+                    pass
+
     def process_source(self, source_path, target_excel, overwrite=False, incremental=False):
         try:
             pythoncom.CoInitialize()
@@ -400,7 +625,7 @@ class DefectProcessor:
                 self._normalize_excel_rows(target_excel)
             except PermissionError:
                 self.log("错误: 目标Excel文件被占用 (Permission denied)。")
-                messagebox.showwarning("文件被占用", "无法写入目标Excel文件。\n\n请检查该文件是否在Excel中打开。\n请关闭文件后再次点击“同步并刷新”。")
+                messagebox.showwarning("文件被占用", "无法写入目标Excel文件。\n\n请检查该文件是否在Excel中打开。\n请关闭文件后再次点击“导入并同步”。")
                 return False
 
             processed = self._load_processed_paths_from_excel(target_excel)
@@ -417,7 +642,7 @@ class DefectProcessor:
                         self._normalize_excel_rows(target_excel)
                     except PermissionError:
                         self.log("错误: 目标Excel文件被占用 (Permission denied)。")
-                        messagebox.showwarning("文件被占用", "无法写入目标Excel文件。\n\n请检查该文件是否在Excel中打开。\n请关闭文件后再次点击“同步并刷新”。")
+                        messagebox.showwarning("文件被占用", "无法写入目标Excel文件。\n\n请检查该文件是否在Excel中打开。\n请关闭文件后再次点击“导入并同步”。")
                         return False
 
                 # 2. Handle new files
@@ -781,12 +1006,12 @@ class StatisticsPanel(ttk.Frame):
         control_frame.pack(fill=X)
         
         # Load Button
-        self.btn_load = ttk.Button(control_frame, text="� 加载数据", command=self.load_data, bootstyle=PRIMARY)
+        self.btn_load = ttk.Button(control_frame, text="🔷 同步数据", command=self.load_data, bootstyle=PRIMARY)
         self.btn_load.pack(side=LEFT)
 
         # Sync Button
         if self.app:
-            self.btn_sync = ttk.Button(control_frame, text="� 同步并刷新", command=self.on_sync, bootstyle=SUCCESS)
+            self.btn_sync = ttk.Button(control_frame, text="🔄 导入并同步", command=self.on_sync, bootstyle=SUCCESS)
             self.btn_sync.pack(side=LEFT, padx=5)
         
         ttk.Separator(control_frame, orient=VERTICAL).pack(side=LEFT, padx=10, fill=Y)
@@ -1490,12 +1715,54 @@ class StatisticsPanel(ttk.Frame):
             
         path = self.file_path_map.get(item_id)
         if path and os.path.exists(path):
-            try:
-                os.startfile(path)
-            except Exception as e:
-                messagebox.showerror("错误", f"无法打开文件: {e}")
+            self._monitor_word_file(path)
         else:
-            messagebox.showwarning("提示", "该条记录未关联到Word文档路径（可能是历史数据）。\n建议点击“加载数据”后再试。")
+            messagebox.showwarning("提示", "该条记录未关联到Word文档路径（可能是历史数据）。\n建议点击“同步数据”后再试。")
+
+    def _monitor_word_file(self, path):
+        def task():
+            try:
+                pythoncom.CoInitialize()
+                word = None
+                try:
+                    word = win32com.client.Dispatch("Word.Application")
+                except Exception:
+                    try:
+                        word = win32com.client.Dispatch("Kwps.Application")
+                    except Exception:
+                        word = win32com.client.Dispatch("Wps.Application")
+                
+                word.Visible = True
+                doc = word.Documents.Open(path)
+                doc_name = doc.Name
+                
+                while True:
+                    time.sleep(1)
+                    try:
+                        found = False
+                        for d in word.Documents:
+                            if d.Name == doc_name:
+                                found = True
+                                break
+                        if not found:
+                            break
+                    except Exception:
+                        break
+                
+                if self.app and hasattr(self.app, 'processor'):
+                     self.app.log_message(f"检测到文档关闭: {os.path.basename(path)}，正在更新数据...")
+                     target_excel = self.excel_path.get()
+                     success = self.app.processor.update_single_file(path, target_excel)
+                     if success:
+                         self.root.after(0, lambda: self.load_data(force=True, silent=True))
+                         self.root.after(0, lambda: messagebox.showinfo("自动同步", f"文档 {os.path.basename(path)} 已更新并同步！"))
+                     else:
+                         self.root.after(0, lambda: messagebox.showerror("自动同步失败", "无法更新数据，请检查日志。"))
+
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"打开文件失败: {e}"))
+                
+        threading.Thread(target=task, daemon=True).start()
 
     def render_charts(self, df=None):
         if df is None:
@@ -2128,8 +2395,11 @@ class App:
              lbl.pack(side=LEFT, padx=15)
 
     def run_sync_process_from_stats(self):
-        if messagebox.askyesno("确认", "是否同步 Word 文档？\n程序将：\n1. 导入新增的文档\n2. 清理已删除文档的记录"):
-            self.run_process_thread(is_sync=True)
+        if not messagebox.askyesno("确认", "是否开始同步流程？\n\n即将执行：\n1. 扫描并导入新增的Word文档\n2. 清理Excel中已删除文档的记录"):
+            return
+            
+        sync_word = messagebox.askyesno("反向同步", "是否将 Excel 中的数据更新到 Word 文档？\n\n如果您在Excel中修改了数据，请选择“是”以同步到Word文档。\n注意：这将覆盖Word文档中的现有表格内容。")
+        self.run_process_thread(is_sync=True, sync_word=sync_word)
 
     # --- Actions ---
     def browse_folder(self):
@@ -2182,7 +2452,7 @@ class App:
             self.progress_var.set(pct)
         self.status_var.set(f"{status_msg} ({current}/{total})")
 
-    def run_process_thread(self, is_sync=False):
+    def run_process_thread(self, is_sync=False, sync_word=False):
         src = self.entry_src.get()
         dst = self.entry_dst.get()
 
@@ -2228,10 +2498,15 @@ class App:
         def task():
             try:
                 success = self.processor.process_source(src, dst, overwrite=False, incremental=is_sync)
+                
+                if success and sync_word:
+                    self.processor.log("开始执行反向同步...")
+                    success = self.processor.sync_word_from_excel(dst)
+
                 if success:
                     if is_sync:
                         self.root.after(0, lambda: self.stats_panel.load_data(force=True, silent=True))
-                        self.root.after(0, lambda: messagebox.showinfo("完成", "同步完成！已导入新增文档并清理无效记录。"))
+                        self.root.after(0, lambda: messagebox.showinfo("完成", "同步完成！"))
                     else:
                         self.root.after(0, lambda: messagebox.showinfo("完成", "数据采集处理完成！\n请切换到“统计分析”查看结果。"))
                 else:
