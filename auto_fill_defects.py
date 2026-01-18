@@ -3,7 +3,7 @@ import sys
 import time
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, LEFT, RIGHT, TOP, BOTTOM, BOTH, X, Y, YES, NO, VERTICAL, HORIZONTAL, W, E, N, S
+from tkinter import filedialog, messagebox, LEFT, RIGHT, TOP, BOTTOM, BOTH, X, Y, YES, NO, VERTICAL, HORIZONTAL, W, E, N, S, CENTER
 import tempfile
 import shutil
 import json
@@ -2617,8 +2617,7 @@ class App:
         if not messagebox.askyesno("确认", "是否开始同步流程？\n\n即将执行：\n1. 扫描并导入新增的Word文档\n2. 清理Excel中已删除文档的记录"):
             return
             
-        sync_word = messagebox.askyesno("反向同步", "是否将 Excel 中的数据更新到 Word 文档？\n\n说明：将按“地点/类型/描述/时间”等字段匹配对应行，只同步“销号/处理/状态/备注”等字段。\n为避免误写，不会整表覆盖。")
-        self.run_process_thread(is_sync=True, sync_word=sync_word)
+        self.run_process_thread(is_sync=True, sync_word=False)
 
     # --- Actions ---
     def browse_folder(self):
