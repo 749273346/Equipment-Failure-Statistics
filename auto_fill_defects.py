@@ -1961,7 +1961,7 @@ class App:
         self.views["collect"] = view
         
         # Header
-        ttk.Label(view, text="数据采集与处理", font=("Microsoft YaHei UI", 18, "bold")).pack(anchor=W, pady=(0, 20))
+        ttk.Label(view, text="数据采集与处理", font=("Microsoft YaHei UI", 18, "bold")).pack(anchor=W, pady=(10, 20))
         
         # Main Card
         card = ttk.Frame(view, style="Card.TFrame", padding=30)
