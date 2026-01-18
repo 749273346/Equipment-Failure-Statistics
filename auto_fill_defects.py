@@ -781,12 +781,12 @@ class StatisticsPanel(ttk.Frame):
         control_frame.pack(fill=X)
         
         # Load Button
-        self.btn_load = ttk.Button(control_frame, text="🔄 加载数据", command=self.load_data, bootstyle=PRIMARY)
+        self.btn_load = ttk.Button(control_frame, text="� 加载数据", command=self.load_data, bootstyle=PRIMARY)
         self.btn_load.pack(side=LEFT)
-        
+
         # Sync Button
         if self.app:
-            self.btn_sync = ttk.Button(control_frame, text="🔁 同步并刷新", command=self.on_sync, bootstyle=SUCCESS)
+            self.btn_sync = ttk.Button(control_frame, text="� 同步并刷新", command=self.on_sync, bootstyle=SUCCESS)
             self.btn_sync.pack(side=LEFT, padx=5)
         
         ttk.Separator(control_frame, orient=VERTICAL).pack(side=LEFT, padx=10, fill=Y)
@@ -825,7 +825,7 @@ class StatisticsPanel(ttk.Frame):
         ttk.Button(control_frame, text="🔄 重置", command=self.reset_list_filters, bootstyle="secondary-outline").pack(side=LEFT, padx=5)
 
         # Status Label
-        self.lbl_status = ttk.Label(control_frame, text="请先加载数据", bootstyle=SECONDARY)
+        self.lbl_status = ttk.Label(control_frame, text="请先同步数据", bootstyle=SECONDARY)
         self.lbl_status.pack(side=LEFT, padx=20)
         
         # Export Button
@@ -883,10 +883,11 @@ class StatisticsPanel(ttk.Frame):
 
     def setup_details_tab(self, parent):
         # --- Treeview ---
-        columns = ("serial", "location", "type", "status", "date", "action")
+        columns = ("serial", "discovery_date", "location", "type", "status", "date", "action")
         self.tree = ttk.Treeview(parent, columns=columns, show="headings", bootstyle="primary")
         
         self.tree.heading("serial", text="序号", command=lambda: self.on_sort_column("serial"))
+        self.tree.heading("discovery_date", text="缺陷发现时间", command=lambda: self.on_sort_column("discovery_date"))
         self.tree.heading("location", text="设备缺陷地点", command=lambda: self.on_sort_column("location"))
         self.tree.heading("type", text="设备缺陷类型", command=lambda: self.on_sort_column("type"))
         self.tree.heading("status", text="状态", command=lambda: self.on_sort_column("status"))
@@ -894,6 +895,7 @@ class StatisticsPanel(ttk.Frame):
         self.tree.heading("action", text="操作")
         
         self.tree.column("serial", width=60, anchor="center")
+        self.tree.column("discovery_date", width=150, anchor="center")
         self.tree.column("location", width=250, anchor="center")
         self.tree.column("type", width=150, anchor="center")
         self.tree.column("status", width=100, anchor="center")
@@ -1265,7 +1267,8 @@ class StatisticsPanel(ttk.Frame):
             return ref_dt
         if ref_dt is None:
             return close_dt
-        return close_dt.where(close_dt.notna(), ref_dt)
+        # Prioritize discovery date (ref_dt) for filtering, fallback to close_dt
+        return ref_dt.where(ref_dt.notna(), close_dt)
 
     def filter_dataframe(
         self,
@@ -1350,7 +1353,7 @@ class StatisticsPanel(ttk.Frame):
         self.sort_col = None
         self.sort_reverse = False
         # Reset headers
-        for c in ["serial", "location", "type", "status", "date"]:
+        for c in ["serial", "discovery_date", "location", "type", "status", "date"]:
             self.tree.heading(c, text=self.tree.heading(c, "text").replace(" ▲", "").replace(" ▼", ""))
         self.refresh_tree_view()
 
@@ -1362,7 +1365,7 @@ class StatisticsPanel(ttk.Frame):
             self.sort_reverse = False
             
         # Update heading indicators
-        for c in ["serial", "location", "type", "status", "date"]:
+        for c in ["serial", "discovery_date", "location", "type", "status", "date"]:
             text = self.tree.heading(c, "text").replace(" ▲", "").replace(" ▼", "")
             if c == self.sort_col:
                 text += " ▼" if self.sort_reverse else " ▲"
@@ -1391,11 +1394,14 @@ class StatisticsPanel(ttk.Frame):
             return
             
         # 2. Apply Sorting
+        discovery_col = self._choose_reference_date_column(df)
+
         if self.sort_col and not df.empty:
             col_map = {
                 "serial": "序号",
                 "location": "设备缺陷地点",
                 "type": "设备缺陷类型",
+                "discovery_date": discovery_col,
                 "status": "销号时间",
                 "date": "销号时间"
             }
@@ -1431,6 +1437,17 @@ class StatisticsPanel(ttk.Frame):
                 serial = index + 1
             loc = row.get('设备缺陷地点', '')
             dtype = row.get('设备缺陷类型', '')
+            
+            discovery_str = "-"
+            if discovery_col and discovery_col in row:
+                try:
+                    d_val = row.get(discovery_col)
+                    d_ts = pd.to_datetime(d_val, errors='coerce')
+                    if pd.notna(d_ts):
+                        discovery_str = d_ts.strftime('%Y-%m-%d')
+                except Exception:
+                    pass
+
             date_val = row.get('销号时间')
             date_ts = pd.to_datetime(date_val, errors='coerce')
             is_closed = pd.notna(date_ts)
@@ -1452,7 +1469,7 @@ class StatisticsPanel(ttk.Frame):
                 source_path = ""
             
             # Insert into Treeview
-            item_id = self.tree.insert("", "end", values=(serial, loc, dtype, status_text, date_str, "📂 打开"))
+            item_id = self.tree.insert("", "end", values=(serial, discovery_str, loc, dtype, status_text, date_str, "📂 打开"))
             
             # Store file path
             if source_path and os.path.exists(source_path):
@@ -1478,7 +1495,7 @@ class StatisticsPanel(ttk.Frame):
             except Exception as e:
                 messagebox.showerror("错误", f"无法打开文件: {e}")
         else:
-            messagebox.showwarning("提示", "该条记录未关联到Word文档路径（可能是历史数据）。\n建议点击“同步并刷新”后再试。")
+            messagebox.showwarning("提示", "该条记录未关联到Word文档路径（可能是历史数据）。\n建议点击“加载数据”后再试。")
 
     def render_charts(self, df=None):
         if df is None:
