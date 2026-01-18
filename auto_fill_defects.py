@@ -552,6 +552,10 @@ class DefectProcessor:
         if not key_cols:
             key_cols = [i for i in range(1, 13) if i not in update_cols][:4]
 
+        base_cols = [i for i in range(1, 13) if i not in update_cols]
+        if not base_cols:
+            base_cols = key_cols[:]
+
         file_rows = {}
         total_rows = 0
         for excel_row_idx, row in enumerate(ws.iter_rows(min_row=4, max_col=14, values_only=True), start=4):
@@ -578,11 +582,12 @@ class DefectProcessor:
             if not has_any:
                 continue
 
-            key = build_key(values, key_cols)
-            if not key:
+            primary_key = build_key(values, key_cols)
+            sig = build_key(values, base_cols)
+            if not primary_key or not sig:
                 continue
 
-            file_rows.setdefault(file_path, []).append((excel_row_idx, values, key))
+            file_rows.setdefault(file_path, []).append((excel_row_idx, values, primary_key, sig))
             total_rows += 1
 
         if not file_rows:
@@ -624,6 +629,8 @@ class DefectProcessor:
             updated_files = 0
             updated_cells = 0
             skipped_rows = 0
+            ambiguous_rows = 0
+            unmatched_rows = 0
 
             for i, (file_path, rows_data) in enumerate(file_rows.items(), start=1):
                 if self.stop_requested:
@@ -655,6 +662,7 @@ class DefectProcessor:
                     table = doc.Tables(1)
                     word_key_to_rows = {}
                     word_row_cache = {}
+                    word_sig_by_row = {}
 
                     for wr in range(2, table.Rows.Count + 1):
                         vals = []
@@ -668,27 +676,73 @@ class DefectProcessor:
                             continue
                         word_key_to_rows.setdefault(k, []).append(wr)
                         word_row_cache[wr] = vals
+                        word_sig_by_row[wr] = build_key(vals, base_cols)
 
                     used_word_rows = set()
                     changed = 0
 
-                    rows_data_sorted = sorted(rows_data, key=lambda x: x[0])
-                    for excel_row_idx, excel_vals, k in rows_data_sorted:
-                        candidates = word_key_to_rows.get(k)
-                        if not candidates:
-                            skipped_rows += 1
-                            continue
-                        if len(candidates) != 1:
-                            skipped_rows += 1
-                            continue
+                    def match_score(excel_vals, word_vals):
+                        score = 0
+                        for idx0 in base_cols:
+                            ev = norm_key_part(excel_vals[idx0])
+                            wv = norm_key_part(word_vals[idx0])
+                            if not ev or not wv:
+                                continue
+                            if ev == wv:
+                                score += 1
+                        return score
 
-                        target_wr = None
-                        for wr in candidates:
-                            if wr not in used_word_rows:
-                                target_wr = wr
-                                break
+                    def pick_best_row(excel_vals, primary_key, sig, used_rows):
+                        candidates = word_key_to_rows.get(primary_key) or []
+                        candidates = [r for r in candidates if r not in used_rows]
+
+                        if candidates:
+                            exact = [r for r in candidates if word_sig_by_row.get(r) == sig]
+                            if len(exact) == 1:
+                                return exact[0], "exact"
+                            if len(exact) > 1:
+                                return None, "ambiguous"
+
+                            scored = []
+                            for r in candidates:
+                                wv = word_row_cache.get(r)
+                                if not wv:
+                                    continue
+                                scored.append((match_score(excel_vals, wv), r))
+                            scored.sort(reverse=True)
+                            if not scored:
+                                return None, "unmatched"
+                            best_score, best_r = scored[0]
+                            second_score = scored[1][0] if len(scored) > 1 else -1
+                            min_needed = max(2, len(base_cols) // 3)
+                            if best_score >= min_needed and best_score > second_score:
+                                return best_r, "scored"
+                            return None, "ambiguous"
+
+                        scored_all = []
+                        for r, wv in word_row_cache.items():
+                            if r in used_rows:
+                                continue
+                            scored_all.append((match_score(excel_vals, wv), r))
+                        scored_all.sort(reverse=True)
+                        if not scored_all:
+                            return None, "unmatched"
+                        best_score, best_r = scored_all[0]
+                        second_score = scored_all[1][0] if len(scored_all) > 1 else -1
+                        min_needed = max(3, len(base_cols) // 2)
+                        if best_score >= min_needed and best_score > second_score:
+                            return best_r, "scored"
+                        return None, "unmatched"
+
+                    rows_data_sorted = sorted(rows_data, key=lambda x: x[0])
+                    for excel_row_idx, excel_vals, primary_key, sig in rows_data_sorted:
+                        target_wr, mode = pick_best_row(excel_vals, primary_key, sig, used_word_rows)
                         if target_wr is None:
                             skipped_rows += 1
+                            if mode == "ambiguous":
+                                ambiguous_rows += 1
+                            else:
+                                unmatched_rows += 1
                             continue
 
                         used_word_rows.add(target_wr)
@@ -728,7 +782,9 @@ class DefectProcessor:
 
             if self.progress:
                 self.progress(total_files, total_files, "完成")
-            self.log(f"反向同步完成：更新文件 {updated_files}/{total_files}，更新单元格 {updated_cells}，跳过记录 {skipped_rows}。")
+            self.log(f"反向同步完成：更新文件 {updated_files}/{total_files}，更新单元格 {updated_cells}，跳过记录 {skipped_rows}（无法匹配 {unmatched_rows}，匹配不唯一 {ambiguous_rows}）。")
+            if updated_cells == 0:
+                self.log("提示：未发生任何写入。通常是因为 Excel 行与 Word 行无法稳定匹配（字段差异/重复记录/合并单元格）。建议先保证“地点/类型/描述/发现时间”等定位字段在两边一致。")
             return True
 
         except Exception as e:
