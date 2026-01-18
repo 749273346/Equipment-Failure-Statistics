@@ -3,7 +3,7 @@ import sys
 import time
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, LEFT, RIGHT, TOP, BOTTOM, BOTH, X, Y, YES, NO, VERTICAL, HORIZONTAL, W, E, N, S
 import tempfile
 import shutil
 import json
@@ -21,6 +21,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+import matplotlib.gridspec as gridspec
 import datetime
 from copy import copy
 
@@ -1267,7 +1268,7 @@ class StatisticsPanel(ttk.Frame):
         self.lbl_status.pack(side=LEFT, padx=20)
         
         # Export Button
-        self.btn_export = ttk.Button(control_frame, text="📤 导出图表", command=self.export_chart, bootstyle=OUTLINE, state="disabled")
+        self.btn_export = ttk.Button(control_frame, text="📤 导出图表", command=self.export_chart, bootstyle="info-outline", state="disabled")
         self.btn_export.pack(side=RIGHT)
 
         # Content Area

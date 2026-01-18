@@ -16,7 +16,7 @@ DisableProgramGroupPage=yes
 ; Remove the following line to run in administrative install mode (install for all users.)
 PrivilegesRequired=lowest
 OutputDir=Install
-OutputBaseFilename=DeviceFaultStats_Setup_v2
+OutputBaseFilename=DeviceDefectStats_Setup
 SetupIconFile=app_icon.ico
 Compression=lzma
 SolidCompression=yes
