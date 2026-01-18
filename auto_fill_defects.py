@@ -1215,68 +1215,82 @@ class StatisticsPanel(ttk.Frame):
         self.setup_ui()
 
     def setup_ui(self):
-        # Top Control Bar (Filter & Actions)
-        control_frame = ttk.Frame(self, padding=5)
-        control_frame.pack(fill=X)
-        
-        # Load Button
-        self.btn_load = ttk.Button(control_frame, text="🔷 同步数据", command=self.load_data, bootstyle=PRIMARY)
-        self.btn_load.pack(side=LEFT)
+        # --- Top Control Bar (Apple-style Layout) ---
+        # Main Container with increased padding and white background
+        control_bar = ttk.Frame(self, style="Card.TFrame", padding=(20, 15, 20, 15))
+        control_bar.pack(fill=X, pady=(0, 1)) # Small gap below
 
-        # Sync Button
+        # --- Left: Data Actions ---
+        action_group = ttk.Frame(control_bar, style="Card.TFrame")
+        action_group.pack(side=LEFT)
+        
+        self.btn_load = ttk.Button(action_group, text=" 同步数据", command=self.load_data, bootstyle="primary", width=10)
+        self.btn_load.pack(side=LEFT, padx=(0, 10))
+
         if self.app:
-            self.btn_sync = ttk.Button(control_frame, text="🔄 导入并同步", command=self.on_sync, bootstyle=SUCCESS)
-            self.btn_sync.pack(side=LEFT, padx=5)
+            self.btn_sync = ttk.Button(action_group, text=" 导入并同步", command=self.on_sync, bootstyle="success", width=12)
+            self.btn_sync.pack(side=LEFT, padx=(0, 10))
         
-        ttk.Separator(control_frame, orient=VERTICAL).pack(side=LEFT, padx=10, fill=Y)
+        # Divider
+        ttk.Separator(control_bar, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=20, pady=5)
 
-        # Date Filter
-        ttk.Label(control_frame, text="年份:").pack(side=LEFT, padx=5)
+        # --- Center Left: Filters ---
+        filter_group = ttk.Frame(control_bar, style="Card.TFrame")
+        filter_group.pack(side=LEFT)
+
+        def create_filter(parent, label, variable, values, width, command=None):
+            f_box = ttk.Frame(parent, style="Card.TFrame")
+            f_box.pack(side=LEFT, padx=(0, 15))
+            
+            lbl = ttk.Label(f_box, text=label, font=("Microsoft YaHei UI", 9), foreground="#666666", background="#FFFFFF")
+            lbl.pack(side=LEFT, padx=(0, 8))
+            
+            cb = ttk.Combobox(f_box, textvariable=variable, values=values, width=width, state="readonly", bootstyle="default")
+            cb.pack(side=LEFT)
+            if command:
+                cb.bind("<<ComboboxSelected>>", command)
+            return cb
+
         self.year_var = tk.StringVar(value="全部")
-        self.year_cb = ttk.Combobox(control_frame, textvariable=self.year_var, values=["全部"], width=8, state="readonly")
-        self.year_cb.pack(side=LEFT)
-        self.year_cb.bind("<<ComboboxSelected>>", self.apply_filter)
+        self.year_cb = create_filter(filter_group, "年份", self.year_var, ["全部"], 8, self.apply_filter)
         
-        ttk.Label(control_frame, text="月份:").pack(side=LEFT, padx=5)
         self.month_var = tk.StringVar(value="全部")
         months = ["全部"] + [f"{i}月" for i in range(1, 13)]
-        self.month_cb = ttk.Combobox(control_frame, textvariable=self.month_var, values=months, width=8, state="readonly")
-        self.month_cb.pack(side=LEFT)
-        self.month_cb.bind("<<ComboboxSelected>>", self.apply_filter)
+        self.month_cb = create_filter(filter_group, "月份", self.month_var, months, 6, self.apply_filter)
         
-        # Status Filter
-        ttk.Label(control_frame, text="状态:").pack(side=LEFT, padx=5)
         self.status_filter_var = tk.StringVar(value="全部状态")
-        self.cb_status = ttk.Combobox(control_frame, textvariable=self.status_filter_var, 
-                                    values=["全部状态", "未销号", "已销号"], width=10, state="readonly")
-        self.cb_status.pack(side=LEFT, padx=5)
-        self.cb_status.bind("<<ComboboxSelected>>", lambda e: self.refresh_tree_view())
+        self.cb_status = create_filter(filter_group, "状态", self.status_filter_var, ["全部状态", "未销号", "已销号"], 10, lambda e: self.refresh_tree_view())
+
+        # --- Right: Search & Tools ---
+        right_group = ttk.Frame(control_bar, style="Card.TFrame")
+        right_group.pack(side=RIGHT)
+
+        # Export (Far Right)
+        self.btn_export = ttk.Button(right_group, text=" 导出图表", command=self.export_chart, bootstyle="info-outline")
+        self.btn_export.pack(side=RIGHT, padx=(15, 0))
+
+        # Search Box Area
+        search_box = ttk.Frame(right_group, style="Card.TFrame")
+        search_box.pack(side=RIGHT)
         
-        # Search
-        ttk.Label(control_frame, text="搜索:").pack(side=LEFT, padx=5)
         self.search_var = tk.StringVar()
-        self.entry_search = ttk.Entry(control_frame, textvariable=self.search_var, width=20)
-        self.entry_search.pack(side=LEFT, padx=5)
+        self.entry_search = ttk.Entry(search_box, textvariable=self.search_var, width=20, bootstyle="secondary")
+        self.entry_search.pack(side=LEFT, padx=(0, 5))
         self.entry_search.bind("<Return>", lambda e: self.refresh_tree_view())
         
-        # Buttons
-        ttk.Button(control_frame, text="🔍 查询", command=self.refresh_tree_view, bootstyle="info-outline").pack(side=LEFT, padx=5)
-        ttk.Button(control_frame, text="🔄 重置", command=self.reset_list_filters, bootstyle="secondary-outline").pack(side=LEFT, padx=5)
+        ttk.Button(search_box, text="查询", command=self.refresh_tree_view, bootstyle="secondary-outline", width=6).pack(side=LEFT, padx=(0, 5))
+        ttk.Button(search_box, text="重置", command=self.reset_list_filters, bootstyle="link-secondary").pack(side=LEFT)
 
-        # Status Label
-        self.lbl_status = ttk.Label(control_frame, text="请先同步数据", bootstyle=SECONDARY)
-        self.lbl_status.pack(side=LEFT, padx=20)
-        
-        # Export Button
-        self.btn_export = ttk.Button(control_frame, text="📤 导出图表", command=self.export_chart, bootstyle="info-outline", state="disabled")
-        self.btn_export.pack(side=RIGHT)
+        # Status Info (Flexible Spacer)
+        self.lbl_status = ttk.Label(control_bar, text="请先同步数据", bootstyle="secondary", background="#FFFFFF", font=("Microsoft YaHei UI", 8))
+        self.lbl_status.pack(side=LEFT, padx=30)
 
-        # Content Area
+        # --- Content Area ---
         self.content_area = ttk.Frame(self)
         self.content_area.pack(fill=BOTH, expand=YES, pady=0)
         
         # View 1: Dashboard
-        self.view_dashboard = ttk.Frame(self.content_area, padding=5)
+        self.view_dashboard = ttk.Frame(self.content_area, padding=10) # Add padding for dashboard
         self.setup_dashboard_tab(self.view_dashboard)
         
         # View 2: Detail List
@@ -1324,7 +1338,11 @@ class StatisticsPanel(ttk.Frame):
         # --- Treeview ---
         # Increase row height for better readability
         style = ttk.Style()
-        style.configure("Treeview", rowheight=30)
+        for style_name in ("Treeview", "primary.Treeview"):
+            try:
+                style.configure(style_name, rowheight=40)
+            except Exception:
+                pass
 
         columns = ("serial", "discovery_date", "location", "type", "status", "date", "action")
         self.tree = ttk.Treeview(parent, columns=columns, show="headings", bootstyle="primary")
