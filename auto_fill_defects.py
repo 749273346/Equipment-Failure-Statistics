@@ -440,11 +440,82 @@ class DefectProcessor:
             return False
 
     def sync_word_from_excel(self, target_excel):
-        """
-        反向同步：将Excel中的数据更新到Word文档中
-        """
         self.log("正在读取Excel数据以同步到Word...")
-        
+
+        def clean_word_text(s):
+            try:
+                s = "" if s is None else str(s)
+            except Exception:
+                return ""
+            return s.replace("\r", "").replace("\x07", "").strip()
+
+        def fmt_excel_value(v):
+            if v is None:
+                return ""
+            try:
+                if isinstance(v, datetime.datetime):
+                    if v.hour == 0 and v.minute == 0 and v.second == 0:
+                        return v.strftime("%Y-%m-%d")
+                    return v.strftime("%Y-%m-%d %H:%M:%S")
+                if isinstance(v, datetime.date):
+                    return v.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+            try:
+                s = str(v)
+            except Exception:
+                return ""
+            s = s.strip()
+            return "" if s == "None" else s
+
+        def norm_key_part(v):
+            s = clean_word_text(v)
+            s = " ".join(s.split())
+            if s:
+                try:
+                    ts = pd.to_datetime(s, errors="coerce")
+                    if pd.notna(ts) and 2000 <= int(ts.year) <= 2100:
+                        if int(ts.hour) == 0 and int(ts.minute) == 0 and int(ts.second) == 0:
+                            return ts.strftime("%Y-%m-%d")
+                        return ts.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    pass
+            return s
+
+        def pick_headers(ws):
+            for r in (3, 2, 1):
+                vals = []
+                non_empty = 0
+                for c in range(1, 14):
+                    v = ws.cell(row=r, column=c).value
+                    s = "" if v is None else str(v).strip()
+                    if s:
+                        non_empty += 1
+                    vals.append(s)
+                if non_empty >= 3:
+                    return vals
+            return [""] * 13
+
+        def build_key(values, key_cols):
+            parts = []
+            for idx in key_cols:
+                try:
+                    parts.append(norm_key_part(values[idx]))
+                except Exception:
+                    parts.append("")
+            parts = [p for p in parts if p]
+            return "||".join(parts)
+
+        def open_word_doc_editable(word_app, file_path):
+            open_kwargs = dict(
+                ReadOnly=False,
+                AddToRecentFiles=False,
+                ConfirmConversions=False,
+                Visible=False,
+                OpenAndRepair=True,
+            )
+            return word_app.Documents.Open(file_path, **open_kwargs)
+
         try:
             wb = openpyxl.load_workbook(target_excel, data_only=True)
             ws = wb.active
@@ -452,141 +523,227 @@ class DefectProcessor:
             self.log(f"无法读取Excel文件: {e}")
             return False
 
-        # 1. Group data by file path
-        file_data_map = {}
-        count = 0
-        try:
-            for row in ws.iter_rows(min_row=4, values_only=True):
-                if not row: continue
-                # Column 14 (index 13) is file path
-                if len(row) < 14: continue
-                
-                path_val = row[13]
-                if not isinstance(path_val, str) or not path_val.strip():
-                    continue
-                
-                full_path = os.path.normpath(path_val.strip())
-                if full_path not in file_data_map:
-                    file_data_map[full_path] = []
-                
-                # Take first 13 columns (data columns)
-                # Ensure we have 13 elements
-                data = list(row[:13])
-                if len(data) < 13:
-                    data.extend([None] * (13 - len(data)))
-                
-                file_data_map[full_path].append(data)
-                count += 1
-        except Exception as e:
-            self.log(f"解析Excel数据失败: {e}")
+        headers = pick_headers(ws)
+
+        update_cols = []
+        for i, h in enumerate(headers):
+            if not h:
+                continue
+            if i == 0:
+                continue
+            if any(k in h for k in ["销号", "处理", "原因", "措施", "整改", "备注", "状态", "完成"]):
+                update_cols.append(i)
+
+        update_cols = sorted(set(update_cols))
+        if not update_cols:
+            self.log("未识别到可同步的字段（如“销号时间/处理情况/备注/状态”等），为避免误写，已取消反向同步。")
             return False
 
-        if not file_data_map:
-            self.log("Excel中没有有效的文件关联记录。")
+        key_cols = []
+        for i, h in enumerate(headers):
+            if not h:
+                continue
+            if any(k in h for k in ["销号", "处理", "原因", "措施", "整改", "备注", "状态", "完成"]):
+                continue
+            if any(k in h for k in ["描述", "地点", "位置", "类型", "发现", "发生", "时间", "日期", "编号"]):
+                key_cols.append(i)
+
+        key_cols = sorted(set(key_cols))
+        if not key_cols:
+            key_cols = [i for i in range(1, 13) if i not in update_cols][:4]
+
+        file_rows = {}
+        total_rows = 0
+        for excel_row_idx, row in enumerate(ws.iter_rows(min_row=4, max_col=14, values_only=True), start=4):
+            if not row or len(row) < 14:
+                continue
+
+            path_val = row[13]
+            if not isinstance(path_val, str) or not path_val.strip():
+                continue
+            file_path = os.path.normpath(path_val.strip())
+
+            values = list(row[:13])
+            if len(values) < 13:
+                values.extend([None] * (13 - len(values)))
+            values = values[:13]
+
+            has_any = False
+            for v in values[1:]:
+                if v is None:
+                    continue
+                if str(v).strip() != "":
+                    has_any = True
+                    break
+            if not has_any:
+                continue
+
+            key = build_key(values, key_cols)
+            if not key:
+                continue
+
+            file_rows.setdefault(file_path, []).append((excel_row_idx, values, key))
+            total_rows += 1
+
+        if not file_rows:
+            self.log("Excel中没有可用于反向同步的数据记录。")
             return True
 
-        self.log(f"读取完成，共找到 {len(file_data_map)} 个文件，{count} 条记录。正在更新Word文档...")
-        
-        # 2. Update Word files
-        word = None
+        word_app = None
         try:
             pythoncom.CoInitialize()
+        except Exception:
+            pass
+
+        try:
             try:
-                word = win32com.client.Dispatch("Word.Application")
-            except Exception:
+                word_app = win32com.client.DispatchEx("Word.Application")
+            except Exception as e:
                 try:
-                    word = win32com.client.Dispatch("Kwps.Application")
+                    word_app = win32com.client.DispatchEx("Kwps.Application")
                 except Exception:
-                    word = win32com.client.Dispatch("Wps.Application")
-            
-            word.Visible = False
-            word.DisplayAlerts = False
-            
-            updated_count = 0
-            total_files = len(file_data_map)
-            
-            for idx, (file_path, rows_data) in enumerate(file_data_map.items()):
-                if self.progress:
-                    self.progress(idx, total_files, f"正在更新: {os.path.basename(file_path)}")
-                
+                    try:
+                        word_app = win32com.client.DispatchEx("Wps.Application")
+                    except Exception:
+                        raise e
+
+            try:
+                word_app.Visible = False
+            except Exception:
+                pass
+            try:
+                word_app.DisplayAlerts = 0
+            except Exception:
+                pass
+            try:
+                word_app.AutomationSecurity = 3
+            except Exception:
+                pass
+
+            total_files = len(file_rows)
+            updated_files = 0
+            updated_cells = 0
+            skipped_rows = 0
+
+            for i, (file_path, rows_data) in enumerate(file_rows.items(), start=1):
                 if self.stop_requested:
                     self.log("用户停止了同步。")
                     break
 
+                file_name = os.path.basename(file_path)
+                if self.progress:
+                    self.progress(i - 1, total_files, f"更新: {file_name}")
+
                 if not os.path.exists(file_path):
                     self.log(f"跳过不存在的文件: {file_path}")
+                    skipped_rows += len(rows_data)
                     continue
 
                 doc = None
                 try:
-                    doc = self._open_word_doc(word, file_path)
-                    
-                    if doc.Tables.Count > 0:
-                        table = doc.Tables(1)
-                        # Word table rows start at 1, data usually starts at 2
-                        # rows_data is list of row values from Excel
-                        
-                        # Check if row counts match
-                        # table.Rows.Count includes header
-                        # So data rows in Word = table.Rows.Count - 1
-                        
-                        # We will overwrite existing rows. 
-                        # If Excel has more rows, we add rows.
-                        # If Excel has fewer rows, we delete rows? 
-                        # Deleting is dangerous. Let's just update existing and add if needed.
-                        
-                        current_word_rows = table.Rows.Count
-                        
-                        for i, row_vals in enumerate(rows_data):
-                            word_row_idx = i + 2 # Start at row 2
-                            
-                            if word_row_idx > table.Rows.Count:
-                                table.Rows.Add()
-                            
-                            for c_idx, val in enumerate(row_vals):
-                                # c_idx 0 (Serial) -> Word Col 1
-                                # Word columns are 1-based
-                                word_col = c_idx + 1
-                                if word_col > 13: break
-                                
-                                val_str = str(val) if val is not None else ""
-                                if val_str == "None": val_str = ""
-                                
-                                try:
-                                    # Assign text
-                                    # Note: Accessing Cell(r,c).Range.Text directly includes end-of-cell marker
-                                    # So we just set it.
-                                    table.Cell(word_row_idx, word_col).Range.Text = val_str
-                                except Exception as e:
-                                    # Cell might not exist if split/merged
-                                    pass
-                        
-                        doc.Save()
-                        updated_count += 1
-                    else:
-                        self.log(f"文件没有表格: {file_path}")
-                        
+                    try:
+                        doc = open_word_doc_editable(word_app, file_path)
+                    except Exception:
+                        time.sleep(0.6)
+                        doc = open_word_doc_editable(word_app, file_path)
+
+                    if doc.Tables.Count <= 0:
+                        self.log(f"跳过无表格文件: {file_path}")
+                        skipped_rows += len(rows_data)
+                        continue
+
+                    table = doc.Tables(1)
+                    word_key_to_rows = {}
+                    word_row_cache = {}
+
+                    for wr in range(2, table.Rows.Count + 1):
+                        vals = []
+                        for c in range(1, 14):
+                            try:
+                                vals.append(clean_word_text(table.Cell(wr, c).Range.Text))
+                            except Exception:
+                                vals.append("")
+                        k = build_key(vals, key_cols)
+                        if not k:
+                            continue
+                        word_key_to_rows.setdefault(k, []).append(wr)
+                        word_row_cache[wr] = vals
+
+                    used_word_rows = set()
+                    changed = 0
+
+                    rows_data_sorted = sorted(rows_data, key=lambda x: x[0])
+                    for excel_row_idx, excel_vals, k in rows_data_sorted:
+                        candidates = word_key_to_rows.get(k)
+                        if not candidates:
+                            skipped_rows += 1
+                            continue
+                        if len(candidates) != 1:
+                            skipped_rows += 1
+                            continue
+
+                        target_wr = None
+                        for wr in candidates:
+                            if wr not in used_word_rows:
+                                target_wr = wr
+                                break
+                        if target_wr is None:
+                            skipped_rows += 1
+                            continue
+
+                        used_word_rows.add(target_wr)
+                        word_vals = word_row_cache.get(target_wr, [""] * 13)
+
+                        for col0 in update_cols:
+                            new_v = fmt_excel_value(excel_vals[col0])
+                            old_v = norm_key_part(word_vals[col0])
+                            if new_v == old_v:
+                                continue
+                            try:
+                                table.Cell(target_wr, col0 + 1).Range.Text = new_v
+                                changed += 1
+                            except Exception:
+                                pass
+
+                    if changed > 0:
+                        try:
+                            doc.Save()
+                        except Exception as e:
+                            self.log(f"保存失败 {file_path}: {e}")
+                            continue
+                        updated_files += 1
+                        updated_cells += changed
+
                 except Exception as e:
-                    self.log(f"更新文件失败 {file_path}: {e}")
+                    self.log(f"更新失败 {file_path}: {type(e).__name__}: {e}")
                 finally:
                     if doc:
                         try:
                             doc.Close(False)
                         except Exception:
-                            pass
-                            
-            self.log(f"Word文档更新完成，共更新 {updated_count} 个文件。")
+                            try:
+                                doc.Close()
+                            except Exception:
+                                pass
+
+            if self.progress:
+                self.progress(total_files, total_files, "完成")
+            self.log(f"反向同步完成：更新文件 {updated_files}/{total_files}，更新单元格 {updated_cells}，跳过记录 {skipped_rows}。")
             return True
-            
+
         except Exception as e:
-            self.log(f"Word服务异常: {e}")
+            self.log(f"Word服务异常: {type(e).__name__}: {e}")
             return False
         finally:
-            if word:
+            if word_app:
                 try:
-                    word.Quit()
+                    word_app.Quit()
                 except Exception:
                     pass
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
     def process_source(self, source_path, target_excel, overwrite=False, incremental=False):
         try:
@@ -1733,6 +1890,11 @@ class StatisticsPanel(ttk.Frame):
                         word = win32com.client.Dispatch("Wps.Application")
                 
                 word.Visible = True
+                try:
+                    word.WindowState = 1  # wdWindowStateMaximize
+                    word.Activate()
+                except Exception:
+                    pass
                 doc = word.Documents.Open(path)
                 doc_name = doc.Name
                 
@@ -2398,7 +2560,7 @@ class App:
         if not messagebox.askyesno("确认", "是否开始同步流程？\n\n即将执行：\n1. 扫描并导入新增的Word文档\n2. 清理Excel中已删除文档的记录"):
             return
             
-        sync_word = messagebox.askyesno("反向同步", "是否将 Excel 中的数据更新到 Word 文档？\n\n如果您在Excel中修改了数据，请选择“是”以同步到Word文档。\n注意：这将覆盖Word文档中的现有表格内容。")
+        sync_word = messagebox.askyesno("反向同步", "是否将 Excel 中的数据更新到 Word 文档？\n\n说明：将按“地点/类型/描述/时间”等字段匹配对应行，只同步“销号/处理/状态/备注”等字段。\n为避免误写，不会整表覆盖。")
         self.run_process_thread(is_sync=True, sync_word=sync_word)
 
     # --- Actions ---
