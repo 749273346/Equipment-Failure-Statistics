@@ -27,14 +27,19 @@
     - **原因**: 只有这样才能防止安装向导界面出现中文乱码（如“安装”显示为乱码）。
 
 #### 3. 构建可执行文件 (Build Executable)
+- **代码健康检查 (Pre-Build Check)**:
+    - **COM/Office**: 如果涉及 Office 自动化，必须检查代码是否在线程中调用了 `pythoncom.CoInitialize()`，并确保有 WPS 兼容性回退（如 `Kwps.Application`）。
 - 使用 `PyInstaller` 进行构建。
 - **强制参数**:
     - `--icon="app_icon.ico"`: 必须嵌入图标。
     - `--noconfirm --onedir --windowed --clean`.
+    - **隐式导入**: 对于 `win32com` 等库，必须在 `.spec` 文件中添加 `hiddenimports=['win32timezone', 'win32com.client']`。
     - 确保生成的 `dist` 目录包含所有依赖。
 
 #### 4. 编写安装脚本 (Scripting - Inno Setup)
 编写 `.iss` 脚本时，必须包含以下“大厂”级细节：
+- **路径一致性**:
+    - 严格检查 `Source` 路径是否匹配 PyInstaller 的输出（如 `dist\MyApp\*`）。
 - **安装路径选择**:
     - 设置 `DefaultDirName={autopf}\{#MyAppName}`。
     - 确保 `DisableDirPage=no`，允许用户自定义安装位置。
@@ -59,6 +64,12 @@
     - [ ] **关键验证**: 安装完成后，桌面快捷方式图标是否与安装包图标一致？（非默认 Python 图标）
     - [ ] 软件能否正常运行？
     - [ ] 卸载是否干净？
+    - [ ] **Office/COM 测试**: 如果涉及 Office 功能，确保在无 Office 环境（或仅有 WPS）下也能正常报错或运行，不直接崩溃。
+
+### 6. 常见打包陷阱 (Common Pitfalls)
+- **COM 组件丢失**: PyInstaller 经常漏掉 `win32timezone`，导致 `win32com` 报错。务必检查 `hiddenimports`。
+- **线程 COM 初始化**: 在非主线程使用 `win32com` 必须调用 `CoInitialize`，否则会报 "无效的类字符串"。
+- **路径错误**: Inno Setup 的 `Source` 路径写错会导致安装包为空或报错，务必核对 `dist` 目录结构。
 
 ### 智能体行为准则 (Agent Guidelines)
 - **主动性**: 缺图标就画，缺工具就装，缺文件就下。不要等待用户提供非核心资源。

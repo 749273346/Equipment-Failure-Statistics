@@ -81,6 +81,16 @@ class DefectProcessor:
         self.stop_requested = False
         self.paused = False
 
+    def _is_doc_path_string(self, value):
+        if not isinstance(value, str):
+            return False
+        s = value.strip()
+        if not s:
+            return False
+        if not s.lower().endswith((".doc", ".docx")):
+            return False
+        return (":\\" in s) or ("\\" in s) or ("/" in s)
+
     def _safe_temp_name(self, name):
         s = str(name or "")
         for ch in ['\\', '/', ':', '*', '?', '"', '<', '>', '|', '：']:
@@ -123,6 +133,8 @@ class DefectProcessor:
         if not row_data or len(row_data) <= 1:
             return False
         for cell in row_data[1:]:
+            if self._is_doc_path_string(cell):
+                continue
             if str(cell).strip():
                 return True
         return False
@@ -146,12 +158,59 @@ class DefectProcessor:
             has_any = False
             for c in range(2, max_cols + 1):
                 v = ws.cell(row=row, column=c).value
+                if self._is_doc_path_string(v):
+                    continue
                 if v is not None and str(v).strip() != "":
                     has_any = True
                     break
             if has_any:
                 return row
         return 0
+
+    def _row_has_any_defect_cells(self, ws, row, start_col=2, end_col=13):
+        for c in range(start_col, end_col + 1):
+            v = ws.cell(row=row, column=c).value
+            if v is not None and str(v).strip() != "":
+                return True
+        return False
+
+    def _normalize_excel_rows(self, target_excel):
+        try:
+            wb = openpyxl.load_workbook(target_excel)
+            ws = wb.active
+
+            deleted = 0
+            for row in range(ws.max_row, 3, -1):
+                path_val = ws.cell(row=row, column=14).value
+                serial_val = ws.cell(row=row, column=1).value
+                has_defect = self._row_has_any_defect_cells(ws, row, start_col=2, end_col=13)
+                has_path = isinstance(path_val, str) and path_val.strip() != ""
+                has_serial = serial_val is not None and str(serial_val).strip() != ""
+
+                if not has_defect and (has_path or has_serial):
+                    ws.delete_rows(row, 1)
+                    deleted += 1
+
+            serial = 0
+            for row in range(4, ws.max_row + 1):
+                if self._row_has_any_defect_cells(ws, row, start_col=2, end_col=13):
+                    serial += 1
+                    ws.cell(row=row, column=1).value = serial
+                else:
+                    ws.cell(row=row, column=1).value = None
+
+            try:
+                ws.column_dimensions[get_column_letter(14)].hidden = True
+            except Exception:
+                pass
+
+            wb.save(target_excel)
+            return deleted
+        except PermissionError:
+            raise
+        except Exception as e:
+            self.log(f"规范化Excel数据时出错: {e}")
+            return 0
 
     def _estimate_row_height(self, row_data, base_height=45, max_height=150):
         data = list(row_data or [])
@@ -291,16 +350,11 @@ class DefectProcessor:
             # Re-serialize
             serial = 0
             for row in range(4, ws.max_row + 1):
-                has_any = False
-                for c in range(2, 14):
-                    v = ws.cell(row=row, column=c).value
-                    if v is not None and str(v).strip() != "":
-                        has_any = True
-                        break
-                
-                if has_any:
+                if self._row_has_any_defect_cells(ws, row, start_col=2, end_col=13):
                     serial += 1
                     ws.cell(row=row, column=1).value = serial
+                else:
+                    ws.cell(row=row, column=1).value = None
 
             wb.save(target_excel)
             return len(rows_to_delete)
@@ -342,6 +396,13 @@ class DefectProcessor:
             pass
 
         if incremental:
+            try:
+                self._normalize_excel_rows(target_excel)
+            except PermissionError:
+                self.log("错误: 目标Excel文件被占用 (Permission denied)。")
+                messagebox.showwarning("文件被占用", "无法写入目标Excel文件。\n\n请检查该文件是否在Excel中打开。\n请关闭文件后再次点击“同步并刷新”。")
+                return False
+
             processed = self._load_processed_paths_from_excel(target_excel)
             if processed:
                 # 1. Handle deleted files
@@ -352,6 +413,12 @@ class DefectProcessor:
                     self.log(f"发现 {len(deleted_files)} 个历史文件已被删除，正在同步清理Excel记录...")
                     removed_count = self._remove_rows_by_paths(target_excel, deleted_files)
                     self.log(f"已清理 {removed_count} 条无效记录。")
+                    try:
+                        self._normalize_excel_rows(target_excel)
+                    except PermissionError:
+                        self.log("错误: 目标Excel文件被占用 (Permission denied)。")
+                        messagebox.showwarning("文件被占用", "无法写入目标Excel文件。\n\n请检查该文件是否在Excel中打开。\n请关闭文件后再次点击“同步并刷新”。")
+                        return False
 
                 # 2. Handle new files
                 before = len(word_files)
@@ -664,6 +731,12 @@ class DefectProcessor:
         # 3. Write to Excel
         try:
             wrote = self._write_rows_to_excel(target_excel, extracted_rows, overwrite=overwrite)
+            try:
+                self._normalize_excel_rows(target_excel)
+            except PermissionError:
+                self.log("错误: 目标Excel文件被占用 (Permission denied)。")
+                messagebox.showwarning("文件被占用", "无法写入目标Excel文件。\n\n请检查该文件是否在Excel中打开。\n请关闭文件后再次点击“开始处理”。")
+                return False
             if overwrite:
                 self.log(f"写入成功！已刷新 {wrote} 条记录，已保存到: {target_excel}")
             else:
@@ -1003,6 +1076,11 @@ class StatisticsPanel(ttk.Frame):
             required_cols = ['设备缺陷类型', '销号时间', '设备缺陷地点']
             if not all(col in df.columns for col in required_cols):
                 df = pd.read_excel(path) 
+            
+            filter_cols = ['设备缺陷地点', '设备缺陷类型', '设备缺陷描述']
+            valid_cols = [c for c in filter_cols if c in df.columns]
+            if valid_cols:
+                df = df.dropna(subset=valid_cols, how='all')
             
             self.df = df
             self._loaded_path = path
@@ -1883,7 +1961,7 @@ class App:
         self.views["collect"] = view
         
         # Header
-        ttk.Label(view, text="数据采集与处理", font=("Microsoft YaHei UI", 24, "bold")).pack(anchor=W, pady=(0, 20))
+        ttk.Label(view, text="数据采集与处理", font=("Microsoft YaHei UI", 18, "bold")).pack(anchor=W, pady=(0, 20))
         
         # Main Card
         card = ttk.Frame(view, style="Card.TFrame", padding=30)
